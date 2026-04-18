@@ -11,7 +11,7 @@ BASE = "http://localhost"
 USER_EMAIL = "raafael.keikko@gmail.com"
 USER_PASS = "enmuista"
 # Admin credentials (from .env)
-ADMIN_USER = "admin"
+ADMIN_USER = "raafael.keikko@gmail.com"
 ADMIN_PASS = "02Enmui1ta"
 OUT = "docs/screenshots"
 
