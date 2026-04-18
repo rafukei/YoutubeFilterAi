@@ -7,6 +7,7 @@ PATCH /api/messages/{id}/visibility – toggle visibility
 DELETE /api/messages/{id}           – delete a message
 """
 
+import asyncio
 from uuid import UUID
 
 import redis.asyncio as aioredis
@@ -19,7 +20,7 @@ from app.database import get_db
 from app.models import Message, Prompt, TelegramBot, WebView, User
 from app.schemas import MessageRead, ProcessVideoRequest, ProcessVideoResponse
 from app.services import extract_video_id, fetch_transcript
-from app.services.ai_service import parse_ai_routing, query_ai
+from app.services.ai_service import parse_ai_routing, query_ai, resolve_folder_prompts
 from app.services.telegram_service import send_telegram_message
 
 router = APIRouter(prefix="/api", tags=["processing"])
@@ -65,96 +66,119 @@ async def process_video(
     if not user.openrouter_api_token:
         raise HTTPException(400, "Set your OpenRouter API token in settings first")
 
-    # 1. Resolve prompt text
-    prompt_text = body.prompt_text
-    if body.prompt_id:
-        result = await db.execute(select(Prompt).where(Prompt.id == body.prompt_id, Prompt.user_id == user.id))
-        prompt = result.scalar_one_or_none()
-        if not prompt or not prompt.body:
-            raise HTTPException(404, "Prompt not found or empty")
-        prompt_text = prompt.body
+    # 1. Resolve prompt(s) — supports single prompts, folders, or ad-hoc text
+    prompts_to_run = []  # list of (prompt_text, ai_model, fallback_model, prompt_id)
 
-    if not prompt_text:
+    if body.prompt_id:
+        resolved = await resolve_folder_prompts(body.prompt_id, user.id, db)
+        if not resolved:
+            raise HTTPException(404, "Prompt/folder not found or contains no executable prompts")
+        for p in resolved:
+            prompts_to_run.append((p.body, p.ai_model or "openai/gpt-3.5-turbo", p.fallback_ai_model, p.id))
+    elif body.prompt_text:
+        prompts_to_run.append((body.prompt_text, "openai/gpt-3.5-turbo", None, None))
+    else:
         raise HTTPException(400, "Provide prompt_id or prompt_text")
 
     # 2. Fetch transcript
     video_id = extract_video_id(body.video_url)
-    transcript = fetch_transcript(video_id)
-
-    # 3. Call AI
-    ai_response = await query_ai(
-        prompt=prompt_text,
-        transcript=transcript,
-        api_token=user.openrouter_api_token,
-        user_id=str(user.id),
-        redis_client=redis,
-    )
-
-    # 4. Parse routing JSON from AI response
-    routing = parse_ai_routing(ai_response)
-
-    # 5. Store message for each target web view
-    source_url = f"https://www.youtube.com/watch?v={video_id}"
-    messages_created = []
-
-    target_views = routing.get("web_views", [])
-    if target_views:
-        for view_name in target_views:
-            wv_result = await db.execute(
-                select(WebView).where(WebView.user_id == user.id, WebView.name == view_name)
+    try:
+        transcript = fetch_transcript(video_id)
+    except Exception as e:
+        err = str(e).lower()
+        if "no subtitles" in err or "no transcript" in err:
+            raise HTTPException(
+                400,
+                "This video has no subtitles/captions available. "
+                "The AI needs text to process — only videos with subtitles (auto-generated or manual) can be analyzed."
             )
-            wv = wv_result.scalar_one_or_none()
-            if wv:
-                msg = Message(
-                    user_id=user.id,
-                    web_view_id=wv.id,
-                    prompt_id=body.prompt_id,
-                    source_video_url=source_url,
-                    transcript_text=transcript,
-                    ai_response=routing.get("message", ai_response),
-                    visibility=routing.get("visibility", True),
+        raise HTTPException(400, f"Could not fetch video transcript: {e}")
+
+    source_url = f"https://www.youtube.com/watch?v={video_id}"
+    all_messages_created = []
+
+    # 3. Process each prompt against the transcript (with delay between calls)
+    for idx, (prompt_text, ai_model, fallback_model, prompt_id) in enumerate(prompts_to_run):
+        if idx > 0:
+            await asyncio.sleep(2)  # Rate-limit delay between AI calls
+
+        try:
+            ai_response = await query_ai(
+                prompt=prompt_text,
+                transcript=transcript,
+                api_token=user.openrouter_api_token,
+                user_id=str(user.id),
+                redis_client=redis,
+                model=ai_model,
+                fallback_model=fallback_model,
+            )
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+
+        # Parse the prompt's own routing JSON to use as fallback
+        prompt_routing = parse_ai_routing(prompt_text) if prompt_text else {}
+        routing = parse_ai_routing(ai_response, prompt_routing=prompt_routing)
+        messages_created = []
+
+        target_views = routing.get("web_views", [])
+        if target_views:
+            for view_name in target_views:
+                wv_result = await db.execute(
+                    select(WebView).where(WebView.user_id == user.id, WebView.name == view_name)
                 )
-                db.add(msg)
-                messages_created.append(msg)
-    else:
-        # No web view specified – store without view
-        msg = Message(
-            user_id=user.id,
-            prompt_id=body.prompt_id,
-            source_video_url=source_url,
-            transcript_text=transcript,
-            ai_response=routing.get("message", ai_response),
-            visibility=routing.get("visibility", True),
-        )
-        db.add(msg)
-        messages_created.append(msg)
+                wv = wv_result.scalar_one_or_none()
+                if wv:
+                    msg = Message(
+                        user_id=user.id,
+                        web_view_id=wv.id,
+                        prompt_id=prompt_id,
+                        source_video_url=source_url,
+                        transcript_text=transcript,
+                        ai_response=routing.get("message", ai_response),
+                        visibility=routing.get("visibility", True),
+                    )
+                    db.add(msg)
+                    messages_created.append(msg)
+        else:
+            msg = Message(
+                user_id=user.id,
+                prompt_id=prompt_id,
+                source_video_url=source_url,
+                transcript_text=transcript,
+                ai_response=routing.get("message", ai_response),
+                visibility=routing.get("visibility", True),
+            )
+            db.add(msg)
+            messages_created.append(msg)
+
+        await db.flush()
+
+        # Send to Telegram bots (only if visibility is true)
+        target_bots = routing.get("telegram_bots", [])
+        if target_bots and routing.get("visibility", True):
+            bots_result = await db.execute(
+                select(TelegramBot).where(TelegramBot.user_id == user.id, TelegramBot.bot_name.in_(target_bots))
+            )
+            for bot in bots_result.scalars():
+                if bot.chat_id:
+                    sent = await send_telegram_message(
+                        bot_token=bot.bot_token,
+                        chat_id=bot.chat_id,
+                        text=routing.get("message", ai_response),
+                        video_url=source_url,
+                    )
+                    if sent:
+                        for m in messages_created:
+                            m.sent_to_telegram = True
+
+        all_messages_created.extend(messages_created)
 
     await db.flush()
-
-    # 6. Send to Telegram bots
-    target_bots = routing.get("telegram_bots", [])
-    if target_bots:
-        bots_result = await db.execute(
-            select(TelegramBot).where(TelegramBot.user_id == user.id, TelegramBot.bot_name.in_(target_bots))
-        )
-        for bot in bots_result.scalars():
-            if bot.chat_id:
-                sent = await send_telegram_message(
-                    bot_token=bot.bot_token,
-                    chat_id=bot.chat_id,
-                    text=routing.get("message", ai_response),
-                    video_url=source_url,
-                )
-                if sent:
-                    for m in messages_created:
-                        m.sent_to_telegram = True
-
-    await db.flush()
-    for m in messages_created:
+    for m in all_messages_created:
         await db.refresh(m)
 
     return ProcessVideoResponse(
-        message=messages_created[0],
+        message=all_messages_created[0],
         raw_transcript=transcript,
     )
 

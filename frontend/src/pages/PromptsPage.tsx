@@ -8,6 +8,7 @@ interface Prompt {
   is_folder: boolean
   body: string | null
   ai_model: string | null
+  fallback_ai_model: string | null
 }
 
 interface AIModel {
@@ -60,6 +61,7 @@ export default function PromptsPage() {
   const [routingJson, setRoutingJson] = useState(JSON.stringify(DEFAULT_ROUTING, null, 2))
   const [jsonError, setJsonError] = useState<string | null>(null)
   const [aiModel, setAiModel] = useState('openai/gpt-3.5-turbo')
+  const [fallbackModel, setFallbackModel] = useState<string | null>(null)
   const [newName, setNewName] = useState('')
   const [activeFolder, setActiveFolder] = useState<string | null>(null)
   const [showGuide, setShowGuide] = useState(false)
@@ -67,7 +69,7 @@ export default function PromptsPage() {
   const [saving, setSaving] = useState(false)
   const [testVideoUrl, setTestVideoUrl] = useState('')
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<{ transcript?: string; response?: string; error?: string } | null>(null)
+  const [testResult, setTestResult] = useState<{ transcript?: string; response?: string; fullPrompt?: string; error?: string } | null>(null)
 
   const load = async () => {
     const [promptsRes, modelsRes] = await Promise.all([
@@ -109,6 +111,7 @@ export default function PromptsPage() {
     setSelected(p)
     parseBodyAndRouting(p.body)
     setAiModel(p.ai_model || 'openai/gpt-3.5-turbo')
+    setFallbackModel(p.fallback_ai_model || null)
     setTestResult(null)
     setTestVideoUrl('')
   }
@@ -139,7 +142,7 @@ export default function PromptsPage() {
     if (routingError) { setJsonError(routingError); return }
     setSaving(true)
     try {
-      await api.patch('/prompts/' + selected.id, { body: getFullBody(), ai_model: aiModel })
+      await api.patch('/prompts/' + selected.id, { body: getFullBody(), ai_model: aiModel, fallback_ai_model: fallbackModel || null })
       load()
     } finally { setSaving(false) }
   }
@@ -177,12 +180,14 @@ export default function PromptsPage() {
     setTesting(true)
     setTestResult(null)
     try {
+      const fullPromptText = getFullBody()
       const { data } = await api.post('/process', {
         video_url: testVideoUrl,
-        prompt_text: getFullBody(),
+        prompt_text: fullPromptText,
         ai_model: aiModel,
       })
       setTestResult({
+        fullPrompt: fullPromptText,
         transcript: data.raw_transcript,
         response: data.message?.ai_response || data.ai_response || JSON.stringify(data, null, 2)
       })
@@ -315,6 +320,32 @@ export default function PromptsPage() {
                   {getModelInfo(aiModel)?.description} • Context: {(getModelInfo(aiModel)?.context_length || 0).toLocaleString()} tokens
                 </p>
               )}
+
+              {/* Fallback Model */}
+              <div className="mt-4 pt-4 border-t border-gray-700">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="font-medium text-gray-100 text-sm">Fallback AI Model <span className="text-gray-500">(optional)</span></label>
+                  {fallbackModel && <button onClick={() => setFallbackModel(null)} className="text-xs text-red-400 hover:text-red-300">Clear</button>}
+                </div>
+                <p className="text-xs text-gray-500 mb-2">
+                  If the primary model fails (e.g. transcript too long for context window), the system will automatically retry with this model.
+                </p>
+                <select className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-gray-100 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                  value={fallbackModel || ''} onChange={e => setFallbackModel(e.target.value || null)}>
+                  <option value="">-- No fallback --</option>
+                  <optgroup label="Large context (good fallbacks)">
+                    <option value="google/gemini-pro-1.5">Gemini Pro 1.5 — 2M tokens context</option>
+                    <option value="anthropic/claude-3.5-sonnet">Claude 3.5 Sonnet — 200K tokens</option>
+                    <option value="openai/gpt-4o">GPT-4o — 128K tokens</option>
+                    <option value="meta-llama/llama-3.1-70b-instruct">Llama 3.1 70B — 131K tokens</option>
+                  </optgroup>
+                  <optgroup label="Other">
+                    {models.filter(m => m.id !== aiModel).map(m => (
+                      <option key={m.id} value={m.id}>{m.name} — {(m.context_length || 0).toLocaleString()} tokens</option>
+                    ))}
+                  </optgroup>
+                </select>
+              </div>
             </div>
 
             {/* Templates */}
@@ -387,16 +418,22 @@ export default function PromptsPage() {
                       <p className="text-sm text-red-300">{testResult.error}</p>
                     </div>
                   )}
+                  {testResult.fullPrompt && (
+                    <div>
+                      <h4 className="text-sm font-medium text-gray-300 mb-1">📤 Full Prompt Sent to AI</h4>
+                      <pre className="bg-gray-900 p-3 rounded-lg text-xs max-h-60 overflow-y-auto whitespace-pre-wrap text-indigo-300 border border-gray-700">{testResult.fullPrompt}</pre>
+                    </div>
+                  )}
                   {testResult.transcript && (
                     <div>
-                      <h4 className="text-sm font-medium text-gray-300 mb-1">Raw Transcript</h4>
+                      <h4 className="text-sm font-medium text-gray-300 mb-1">📜 Raw Transcript</h4>
                       <pre className="bg-gray-900 p-3 rounded-lg text-xs max-h-40 overflow-y-auto whitespace-pre-wrap text-gray-400 border border-gray-700">{testResult.transcript}</pre>
                     </div>
                   )}
                   {testResult.response && (
                     <div>
-                      <h4 className="text-sm font-medium text-gray-300 mb-1">AI Response</h4>
-                      <div className="bg-gray-900 p-3 rounded-lg whitespace-pre-wrap text-gray-100 border border-gray-700 text-sm">{testResult.response}</div>
+                      <h4 className="text-sm font-medium text-gray-300 mb-1">📥 Complete AI Response (raw)</h4>
+                      <pre className="bg-gray-900 p-3 rounded-lg text-sm max-h-80 overflow-y-auto whitespace-pre-wrap text-gray-100 border border-gray-700">{testResult.response}</pre>
                     </div>
                   )}
                 </div>

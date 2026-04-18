@@ -9,18 +9,23 @@ DELETE /api/admin/users/{id} – delete user (GDPR)
 GET   /api/admin/settings – read app settings
 PATCH /api/admin/settings – update app settings
 GET   /api/admin/stats   – system statistics
+POST  /api/admin/cleanup-messages – enforce message history limit
+GET   /api/admin/backup  – download full database backup as JSON
 """
 
+import json
+from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update, func
+from fastapi.responses import JSONResponse
+from sqlalchemy import select, update, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import create_access_token, verify_password, oauth2_scheme, hash_password
 from app.config import get_settings
 from app.database import get_db
-from app.models import User, AppSettings, Prompt, Message, YouTubeChannel, TelegramBot
+from app.models import User, AppSettings, Prompt, Message, YouTubeChannel, TelegramBot, WebView
 from app.schemas import (
     AdminLoginRequest, TokenResponse, UserRead, UserCreate,
     AppSettingsRead, AppSettingsUpdate, AdminStatsResponse
@@ -207,6 +212,7 @@ async def get_app_settings(db: AsyncSession = Depends(get_db)):
         allow_gmail_auth=app_settings.allow_gmail_auth,
         google_client_id=masked_client_id,
         openrouter_rate_limit=app_settings.openrouter_rate_limit,
+        max_message_history=app_settings.max_message_history,
         updated_at=app_settings.updated_at,
     )
 
@@ -246,6 +252,8 @@ async def update_app_settings(body: AppSettingsUpdate, db: AsyncSession = Depend
         app_settings.google_client_secret = body.google_client_secret
     if body.openrouter_rate_limit is not None:
         app_settings.openrouter_rate_limit = body.openrouter_rate_limit
+    if body.max_message_history is not None:
+        app_settings.max_message_history = body.max_message_history
     
     await db.commit()
     await db.refresh(app_settings)
@@ -261,6 +269,7 @@ async def update_app_settings(body: AppSettingsUpdate, db: AsyncSession = Depend
         allow_gmail_auth=app_settings.allow_gmail_auth,
         google_client_id=masked_client_id,
         openrouter_rate_limit=app_settings.openrouter_rate_limit,
+        max_message_history=app_settings.max_message_history,
         updated_at=app_settings.updated_at,
     )
 
@@ -299,4 +308,202 @@ async def get_admin_stats(db: AsyncSession = Depends(get_db)):
         total_messages=total_messages or 0,
         total_channels=total_channels or 0,
         total_bots=total_bots or 0,
+    )
+
+
+async def enforce_message_limit(db: AsyncSession, max_messages: int) -> int:
+    """Delete oldest messages per user when count exceeds the limit.
+
+    Args:
+        db: Async database session.
+        max_messages: Maximum messages allowed per user (0 = unlimited).
+
+    Returns:
+        int: Total number of messages deleted across all users.
+    """
+    if max_messages <= 0:
+        return 0
+
+    deleted_total = 0
+    result = await db.execute(select(User.id))
+    user_ids = result.scalars().all()
+
+    for user_id in user_ids:
+        count = await db.scalar(
+            select(func.count(Message.id)).where(Message.user_id == user_id)
+        )
+        if count and count > max_messages:
+            excess = count - max_messages
+            # Find the IDs of the oldest excess messages
+            oldest = await db.execute(
+                select(Message.id)
+                .where(Message.user_id == user_id)
+                .order_by(Message.created_at.asc())
+                .limit(excess)
+            )
+            ids_to_delete = oldest.scalars().all()
+            if ids_to_delete:
+                await db.execute(
+                    delete(Message).where(Message.id.in_(ids_to_delete))
+                )
+                deleted_total += len(ids_to_delete)
+
+    await db.commit()
+    return deleted_total
+
+
+@router.post("/cleanup-messages", dependencies=[Depends(get_admin)])
+async def cleanup_messages(db: AsyncSession = Depends(get_db)):
+    """Enforce the message history limit by deleting oldest messages per user.
+
+    Reads max_message_history from app_settings and removes excess messages.
+
+    Args:
+        db: Async database session (injected).
+
+    Returns:
+        dict: Number of deleted messages.
+    """
+    result = await db.execute(select(AppSettings).where(AppSettings.key == "default"))
+    app_settings = result.scalar_one_or_none()
+    max_msgs = app_settings.max_message_history if app_settings else 1000
+
+    deleted = await enforce_message_limit(db, max_msgs)
+    return {"deleted_messages": deleted, "max_message_history": max_msgs}
+
+
+@router.get("/backup", dependencies=[Depends(get_admin)])
+async def create_backup(db: AsyncSession = Depends(get_db)):
+    """Create a full JSON backup of all database tables.
+
+    Exports users (without passwords), prompts, channels, bots, web views,
+    messages, and app settings.
+
+    Args:
+        db: Async database session (injected).
+
+    Returns:
+        JSONResponse: Complete database dump as JSON.
+    """
+    # Users (exclude hashed_password for security)
+    users_result = await db.execute(select(User))
+    users = [
+        {
+            "id": str(u.id),
+            "email": u.email,
+            "is_active": u.is_active,
+            "is_approved": u.is_approved,
+            "gdpr_consent_at": u.gdpr_consent_at.isoformat() if u.gdpr_consent_at else None,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+        }
+        for u in users_result.scalars().all()
+    ]
+
+    # Prompts
+    prompts_result = await db.execute(select(Prompt))
+    prompts = [
+        {
+            "id": str(p.id),
+            "user_id": str(p.user_id),
+            "parent_id": str(p.parent_id) if p.parent_id else None,
+            "name": p.name,
+            "is_folder": p.is_folder,
+            "body": p.body,
+            "ai_model": p.ai_model,
+            "fallback_ai_model": p.fallback_ai_model,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in prompts_result.scalars().all()
+    ]
+
+    # Channels
+    channels_result = await db.execute(select(YouTubeChannel))
+    channels = [
+        {
+            "id": str(c.id),
+            "user_id": str(c.user_id),
+            "channel_id": c.channel_id,
+            "channel_name": c.channel_name,
+            "check_interval_minutes": c.check_interval_minutes,
+            "is_active": c.is_active,
+            "last_video_id": c.last_video_id,
+            "prompt_id": str(c.prompt_id) if c.prompt_id else None,
+            "added_at": c.added_at.isoformat() if c.added_at else None,
+        }
+        for c in channels_result.scalars().all()
+    ]
+
+    # Telegram Bots (exclude bot_token for security)
+    bots_result = await db.execute(select(TelegramBot))
+    bots = [
+        {
+            "id": str(b.id),
+            "user_id": str(b.user_id),
+            "bot_name": b.bot_name,
+            "chat_id": b.chat_id,
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+        }
+        for b in bots_result.scalars().all()
+    ]
+
+    # Web Views
+    views_result = await db.execute(select(WebView))
+    views = [
+        {
+            "id": str(v.id),
+            "user_id": str(v.user_id),
+            "name": v.name,
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        }
+        for v in views_result.scalars().all()
+    ]
+
+    # Messages
+    messages_result = await db.execute(select(Message))
+    messages = [
+        {
+            "id": str(m.id),
+            "user_id": str(m.user_id),
+            "web_view_id": str(m.web_view_id) if m.web_view_id else None,
+            "prompt_id": str(m.prompt_id) if m.prompt_id else None,
+            "source_video_url": m.source_video_url,
+            "source_video_title": m.source_video_title,
+            "ai_response": m.ai_response,
+            "visibility": m.visibility,
+            "sent_to_telegram": m.sent_to_telegram,
+            "created_at": m.created_at.isoformat() if m.created_at else None,
+        }
+        for m in messages_result.scalars().all()
+    ]
+
+    # App Settings
+    settings_result = await db.execute(select(AppSettings))
+    app_settings = settings_result.scalar_one_or_none()
+    settings_data = None
+    if app_settings:
+        settings_data = {
+            "registration_enabled": app_settings.registration_enabled,
+            "require_approval": app_settings.require_approval,
+            "allow_gmail_auth": app_settings.allow_gmail_auth,
+            "openrouter_rate_limit": app_settings.openrouter_rate_limit,
+            "max_message_history": app_settings.max_message_history,
+            "channel_request_delay": app_settings.channel_request_delay,
+        }
+
+    backup = {
+        "backup_created_at": datetime.utcnow().isoformat(),
+        "users": users,
+        "prompts": prompts,
+        "youtube_channels": channels,
+        "telegram_bots": bots,
+        "web_views": views,
+        "messages": messages,
+        "app_settings": settings_data,
+    }
+
+    return JSONResponse(
+        content=backup,
+        headers={
+            "Content-Disposition": f'attachment; filename="backup_{datetime.utcnow().strftime("%Y%m%d_%H%M%S")}.json"'
+        },
     )

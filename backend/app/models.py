@@ -63,6 +63,7 @@ class Prompt(Base):
     is_folder = Column(Boolean, default=False)
     body = Column(Text, nullable=True)  # null for folders
     ai_model = Column(String(128), nullable=True, default="openai/gpt-3.5-turbo")  # OpenRouter model ID
+    fallback_ai_model = Column(String(128), nullable=True)  # Optional fallback model (e.g. if primary has context limit)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -177,4 +178,5 @@ class AppSettings(Base):
     google_client_secret = Column(String(256), nullable=True)
     openrouter_rate_limit = Column(Integer, default=10)  # requests per minute
     channel_request_delay = Column(Integer, default=5)  # seconds between YouTube requests
+    max_message_history = Column(Integer, default=1000)  # max stored messages per user (0 = unlimited)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

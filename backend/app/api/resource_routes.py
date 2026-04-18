@@ -19,6 +19,7 @@ from app.schemas import (
     YouTubeChannelCreate, YouTubeChannelRead, YouTubeChannelUpdate,
     TelegramBotCreate, TelegramBotRead,
     WebViewCreate, WebViewRead,
+    UserDataExport, UserDataImport, ImportResult,
 )
 from app.services.ai_service import get_available_models
 
@@ -435,3 +436,91 @@ async def update_channel(
     await db.commit()
     await db.refresh(ch)
     return ch
+
+
+# ── Data Export ──────────────────────────────────────────────────────────────
+
+@router.get("/export", response_model=UserDataExport)
+async def export_user_data(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Export all user's prompts and channel subscriptions as JSON.
+
+    Allows the user to download a backup of their own data (prompts + channels).
+
+    Args:
+        user: Current authenticated user (injected via JWT).
+        db: Async database session (injected).
+
+    Returns:
+        UserDataExport: User's prompts and channel subscriptions.
+    """
+    from datetime import datetime
+
+    prompts_result = await db.execute(
+        select(Prompt).where(Prompt.user_id == user.id).order_by(Prompt.name)
+    )
+    channels_result = await db.execute(
+        select(YouTubeChannel).where(YouTubeChannel.user_id == user.id).order_by(YouTubeChannel.channel_name)
+    )
+
+    return UserDataExport(
+        exported_at=datetime.utcnow(),
+        email=user.email,
+        prompts=prompts_result.scalars().all(),
+        channels=channels_result.scalars().all(),
+    )
+
+
+@router.post("/import", response_model=ImportResult)
+async def import_user_data(body: UserDataImport, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Import prompts and channel subscriptions from a previously exported JSON.
+
+    Duplicate prompts (same name) and channels (same channel_id) are skipped.
+
+    Args:
+        body: UserDataImport with lists of prompts and channels to import.
+        user: Current authenticated user (injected via JWT).
+        db: Async database session (injected).
+
+    Returns:
+        ImportResult: Counts of imported and skipped items.
+    """
+    prompts_imported = 0
+    prompts_skipped = 0
+    channels_imported = 0
+    channels_skipped = 0
+
+    # Import prompts (skip duplicates by name)
+    for p in body.prompts:
+        existing = await db.execute(
+            select(Prompt).where(Prompt.user_id == user.id, Prompt.name == p.name)
+        )
+        if existing.scalar_one_or_none():
+            prompts_skipped += 1
+            continue
+        prompt = Prompt(user_id=user.id, **p.model_dump(exclude={"parent_id"}))
+        db.add(prompt)
+        prompts_imported += 1
+
+    # Import channels (skip duplicates by channel_id)
+    for c in body.channels:
+        existing = await db.execute(
+            select(YouTubeChannel).where(
+                YouTubeChannel.user_id == user.id,
+                YouTubeChannel.channel_id == c.channel_id,
+            )
+        )
+        if existing.scalar_one_or_none():
+            channels_skipped += 1
+            continue
+        channel = YouTubeChannel(user_id=user.id, **c.model_dump())
+        db.add(channel)
+        channels_imported += 1
+
+    await db.commit()
+
+    return ImportResult(
+        prompts_imported=prompts_imported,
+        channels_imported=channels_imported,
+        prompts_skipped=prompts_skipped,
+        channels_skipped=channels_skipped,
+    )

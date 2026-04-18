@@ -8,6 +8,7 @@ interface AppSettings {
   google_client_id: string | null
   openrouter_rate_limit: number
   channel_request_delay: number
+  max_message_history: number
   updated_at: string | null
 }
 
@@ -38,6 +39,7 @@ export default function AdminSettingsPage() {
   const [googleClientSecret, setGoogleClientSecret] = useState('')
   const [openrouterRateLimit, setOpenrouterRateLimit] = useState(10)
   const [channelRequestDelay, setChannelRequestDelay] = useState(5)
+  const [maxMessageHistory, setMaxMessageHistory] = useState(1000)
 
   useEffect(() => {
     loadData()
@@ -60,6 +62,7 @@ export default function AdminSettingsPage() {
       setAllowGmailAuth(s.allow_gmail_auth)
       setOpenrouterRateLimit(s.openrouter_rate_limit)
       setChannelRequestDelay(s.channel_request_delay)
+      setMaxMessageHistory(s.max_message_history)
       
       setStats(statsRes.data as AdminStats)
     } catch (err: any) {
@@ -81,6 +84,7 @@ export default function AdminSettingsPage() {
         allow_gmail_auth: allowGmailAuth,
         openrouter_rate_limit: openrouterRateLimit,
         channel_request_delay: channelRequestDelay,
+        max_message_history: maxMessageHistory,
       }
       
       // Only include OAuth credentials if provided
@@ -254,6 +258,66 @@ export default function AdminSettingsPage() {
                 />
               </div>
               <p className="text-sm text-gray-500 ml-1">Higher delay reduces the risk of YouTube IP bans. Recommended: 5–15 seconds.</p>
+            </div>
+          </div>
+
+          {/* Database Management */}
+          <div className="border-b border-gray-700 pb-6">
+            <h3 className="text-md font-medium text-gray-100 mb-4">Database Management</h3>
+            
+            <div className="space-y-4">
+              <div className="flex items-center space-x-4">
+                <label className="text-gray-300">Max message history per user:</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100000"
+                  value={maxMessageHistory}
+                  onChange={(e) => setMaxMessageHistory(parseInt(e.target.value) || 0)}
+                  className="w-32 px-3 py-2 bg-gray-700 border border-gray-600 rounded-lg text-gray-100 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                />
+              </div>
+              <p className="text-sm text-gray-500 ml-1">Maximum stored messages per user. Set to 0 for unlimited. Oldest messages are deleted first.</p>
+              
+              <div className="flex gap-3 mt-4">
+                <button
+                  onClick={async () => {
+                    try {
+                      setError(null)
+                      const res = await api.post('/admin/cleanup-messages')
+                      setSuccess(`Cleanup complete: ${res.data.deleted_messages} messages removed`)
+                      loadData()
+                    } catch (err: any) {
+                      setError(err.response?.data?.detail || 'Cleanup failed')
+                    }
+                  }}
+                  className="px-4 py-2 bg-yellow-600 text-white font-semibold rounded-lg hover:bg-yellow-500 transition"
+                >
+                  Run Cleanup Now
+                </button>
+                
+                <button
+                  onClick={async () => {
+                    try {
+                      setError(null)
+                      const res = await api.get('/admin/backup')
+                      const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json' })
+                      const url = URL.createObjectURL(blob)
+                      const a = document.createElement('a')
+                      a.href = url
+                      a.download = `backup_${new Date().toISOString().slice(0, 19).replace(/[:-]/g, '')}.json`
+                      a.click()
+                      URL.revokeObjectURL(url)
+                      setSuccess('Backup downloaded successfully!')
+                    } catch (err: any) {
+                      setError(err.response?.data?.detail || 'Backup failed')
+                    }
+                  }}
+                  className="px-4 py-2 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-500 transition"
+                >
+                  Download Backup
+                </button>
+              </div>
             </div>
           </div>
 

@@ -183,6 +183,79 @@ export default function SettingsPage() {
         </div>
       </div>
 
+      {/* Data Export & Import */}
+      <div className="bg-gray-800 border border-gray-700 rounded-2xl shadow-lg p-6">
+        <h2 className="text-lg font-semibold text-gray-100 mb-2">Export & Import Data</h2>
+        <p className="text-sm text-gray-400 mb-4">
+          Download a backup of your prompts and channel subscriptions, or restore from a previous export.
+        </p>
+        <div className="flex flex-wrap gap-3">
+          <button
+            onClick={async () => {
+              try {
+                setError(null)
+                const res = await api.get('/export')
+                const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json' })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement('a')
+                a.href = url
+                a.download = `my_data_${new Date().toISOString().slice(0, 10)}.json`
+                a.click()
+                URL.revokeObjectURL(url)
+                setSuccess('Data exported successfully!')
+              } catch (err: any) {
+                setError(err.response?.data?.detail || 'Export failed')
+              }
+            }}
+            className="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-500 transition"
+          >
+            Export Prompts & Channels
+          </button>
+
+          <label className="px-4 py-2 bg-green-700 text-white font-semibold rounded-lg hover:bg-green-600 transition cursor-pointer">
+            Import from File
+            <input
+              type="file"
+              accept=".json"
+              className="hidden"
+              onChange={async (e) => {
+                const file = e.target.files?.[0]
+                if (!file) return
+                try {
+                  setError(null)
+                  setSuccess(null)
+                  const text = await file.text()
+                  const data = JSON.parse(text)
+                  const payload = {
+                    prompts: (data.prompts || []).map((p: any) => ({
+                      name: p.name,
+                      is_folder: p.is_folder || false,
+                      body: p.body || null,
+                      ai_model: p.ai_model || 'openai/gpt-3.5-turbo',
+                      fallback_ai_model: p.fallback_ai_model || null,
+                    })),
+                    channels: (data.channels || []).map((c: any) => ({
+                      channel_id: c.channel_id,
+                      channel_name: c.channel_name,
+                      check_interval_minutes: c.check_interval_minutes || 60,
+                    })),
+                  }
+                  const res = await api.post('/import', payload)
+                  const r = res.data
+                  setSuccess(
+                    `Imported ${r.prompts_imported} prompts, ${r.channels_imported} channels. ` +
+                    `Skipped ${r.prompts_skipped} duplicate prompts, ${r.channels_skipped} duplicate channels.`
+                  )
+                } catch (err: any) {
+                  setError(err.response?.data?.detail || err.message || 'Import failed')
+                }
+                e.target.value = ''
+              }}
+            />
+          </label>
+        </div>
+      </div>
+
       {/* Help Section */}
       <div className="bg-indigo-900/30 border border-indigo-700/50 rounded-2xl p-6">
         <h3 className="font-semibold text-indigo-300 mb-2">How to get an OpenRouter API key</h3>

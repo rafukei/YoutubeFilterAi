@@ -19,9 +19,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import async_session as async_session_factory
-from app.models import YouTubeChannel, Prompt, TelegramBot, WebView, Message, User
+from app.models import YouTubeChannel, TelegramBot, WebView, Message, User
 from app.services import extract_video_id, fetch_transcript
-from app.services.ai_service import query_ai, parse_ai_routing
+from app.services.ai_service import query_ai, parse_ai_routing, resolve_folder_prompts
 from app.services.telegram_service import send_telegram_message
 
 logger = logging.getLogger("scheduler")
@@ -326,17 +326,16 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         channel.last_checked_at = datetime.utcnow()
         return
 
-    # Load the prompt
+    # Load the prompt(s) — supports both single prompts and folders
     if not channel.prompt_id:
         logger.warning("Channel %s has no prompt assigned – skipping", channel.channel_name)
         channel.last_checked_at = datetime.utcnow()
         channel.last_video_id = new_video_id
         return
 
-    prompt_result = await db.execute(select(Prompt).where(Prompt.id == channel.prompt_id))
-    prompt = prompt_result.scalar_one_or_none()
-    if not prompt or not prompt.body:
-        logger.warning("Prompt %s not found or empty – skipping", channel.prompt_id)
+    prompts_to_run = await resolve_folder_prompts(channel.prompt_id, channel.user_id, db)
+    if not prompts_to_run:
+        logger.warning("Prompt/folder %s has no executable prompts – skipping", channel.prompt_id)
         channel.last_checked_at = datetime.utcnow()
         channel.last_video_id = new_video_id
         return
@@ -354,96 +353,108 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         await db.commit()
         return
 
-    # Call AI (retry up to 3 times on 503 errors)
-    ai_response = None
-    max_retries = 3
-    retry_delay = 10
-    try:
-        ai_model = prompt.ai_model or "openai/gpt-3.5-turbo"
-        for attempt in range(1, max_retries + 1):
-            try:
-                ai_response = await query_ai(
-                    prompt=prompt.body,
-                    transcript=transcript,
-                    api_token=user.openrouter_api_token,
-                    user_id=str(user.id),
-                    redis_client=redis_client,
-                    model=ai_model,
-                )
-                break  # success
-            except Exception as e:
-                if "503" in str(e) and attempt < max_retries:
-                    logger.warning("AI 503 for video %s (attempt %d/%d), retrying in %ds…",
-                                   new_video_id, attempt, max_retries, retry_delay)
-                    await asyncio.sleep(retry_delay)
-                else:
-                    raise
-    except Exception as e:
-        logger.error("AI query failed for video %s: %s", new_video_id, e)
-        channel.last_checked_at = datetime.utcnow()
-        return
-
-    # Parse routing
-    routing = parse_ai_routing(ai_response)
+    # Process each prompt against the same transcript (with delay between AI calls)
     source_url = f"https://www.youtube.com/watch?v={new_video_id}"
 
-    # Store messages
-    target_views = routing.get("web_views", [])
-    messages_created = []
-    if target_views:
-        for view_name in target_views:
-            wv_result = await db.execute(
-                select(WebView).where(WebView.user_id == user.id, WebView.name == view_name)
-            )
-            wv = wv_result.scalar_one_or_none()
-            if wv:
-                msg = Message(
-                    user_id=user.id,
-                    web_view_id=wv.id,
-                    prompt_id=channel.prompt_id,
-                    source_video_url=source_url,
-                    source_video_title=latest["title"],
-                    transcript_text=transcript,
-                    ai_response=routing.get("message", ai_response),
-                    visibility=routing.get("visibility", True),
-                )
-                db.add(msg)
-                messages_created.append(msg)
-    else:
-        msg = Message(
-            user_id=user.id,
-            prompt_id=channel.prompt_id,
-            source_video_url=source_url,
-            source_video_title=latest["title"],
-            transcript_text=transcript,
-            ai_response=routing.get("message", ai_response),
-            visibility=routing.get("visibility", True),
-        )
-        db.add(msg)
-        messages_created.append(msg)
+    for prompt_idx, prompt in enumerate(prompts_to_run):
+        # Delay between AI calls to avoid rate limiting (skip first)
+        if prompt_idx > 0:
+            await asyncio.sleep(3)
 
-    await db.flush()
+        # Call AI (retry up to 3 times on 503 errors), with fallback model support
+        ai_response = None
+        max_retries = 3
+        retry_delay = 10
+        try:
+            ai_model = prompt.ai_model or "openai/gpt-3.5-turbo"
+            fallback_model = prompt.fallback_ai_model
+            for attempt in range(1, max_retries + 1):
+                try:
+                    ai_response = await query_ai(
+                        prompt=prompt.body,
+                        transcript=transcript,
+                        api_token=user.openrouter_api_token,
+                        user_id=str(user.id),
+                        redis_client=redis_client,
+                        model=ai_model,
+                        fallback_model=fallback_model,
+                    )
+                    break  # success
+                except Exception as e:
+                    if "503" in str(e) and attempt < max_retries:
+                        logger.warning("AI 503 for video %s prompt %s (attempt %d/%d), retrying in %ds…",
+                                       new_video_id, prompt.name, attempt, max_retries, retry_delay)
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        raise
+        except Exception as e:
+            logger.error("AI query failed for video %s prompt %s: %s", new_video_id, prompt.name, e)
+            continue  # Skip this prompt, try the next one
 
-    # Send to Telegram
-    target_bots = routing.get("telegram_bots", [])
-    if target_bots:
-        bots_result = await db.execute(
-            select(TelegramBot).where(
-                TelegramBot.user_id == user.id,
-                TelegramBot.bot_name.in_(target_bots),
-            )
-        )
-        for bot in bots_result.scalars():
-            if bot.chat_id:
-                sent = await send_telegram_message(
-                    bot_token=bot.bot_token,
-                    chat_id=bot.chat_id,
-                    text=routing.get("message", ai_response),
-                    video_url=source_url,
+        # Parse routing — use prompt's own routing JSON as fallback
+        prompt_routing = parse_ai_routing(prompt.body) if prompt.body else {}
+        routing = parse_ai_routing(ai_response, prompt_routing=prompt_routing)
+
+        # Store messages
+        target_views = routing.get("web_views", [])
+        messages_created = []
+        if target_views:
+            for view_name in target_views:
+                wv_result = await db.execute(
+                    select(WebView).where(WebView.user_id == user.id, WebView.name == view_name)
                 )
-                if sent:
-                    for m in messages_created:
-                        m.sent_to_telegram = True
+                wv = wv_result.scalar_one_or_none()
+                if wv:
+                    msg = Message(
+                        user_id=user.id,
+                        web_view_id=wv.id,
+                        prompt_id=prompt.id,
+                        source_video_url=source_url,
+                        source_video_title=latest["title"],
+                        transcript_text=transcript,
+                        ai_response=routing.get("message", ai_response),
+                        visibility=routing.get("visibility", True),
+                    )
+                    db.add(msg)
+                    messages_created.append(msg)
+        else:
+            msg = Message(
+                user_id=user.id,
+                prompt_id=prompt.id,
+                source_video_url=source_url,
+                source_video_title=latest["title"],
+                transcript_text=transcript,
+                ai_response=routing.get("message", ai_response),
+                visibility=routing.get("visibility", True),
+            )
+            db.add(msg)
+            messages_created.append(msg)
+
+        await db.flush()
+
+        # Send to Telegram (only if visibility is true)
+        target_bots = routing.get("telegram_bots", [])
+        if target_bots and routing.get("visibility", True):
+            bots_result = await db.execute(
+                select(TelegramBot).where(
+                    TelegramBot.user_id == user.id,
+                    TelegramBot.bot_name.in_(target_bots),
+                )
+            )
+            for bot in bots_result.scalars():
+                if bot.chat_id:
+                    sent = await send_telegram_message(
+                        bot_token=bot.bot_token,
+                        chat_id=bot.chat_id,
+                        text=routing.get("message", ai_response),
+                        video_url=source_url,
+                    )
+                    if sent:
+                        for m in messages_created:
+                            m.sent_to_telegram = True
+
+        logger.info("Processed prompt '%s' for video %s on channel %s",
+                     prompt.name, new_video_id, channel.channel_name)
 
     # Update channel state
     channel.last_video_id = new_video_id

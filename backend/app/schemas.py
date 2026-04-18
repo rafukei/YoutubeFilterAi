@@ -69,6 +69,7 @@ class PromptCreate(BaseModel):
     is_folder: bool = False
     body: Optional[str] = None
     ai_model: Optional[str] = "openai/gpt-3.5-turbo"
+    fallback_ai_model: Optional[str] = None
 
 
 class PromptRead(BaseModel):
@@ -78,6 +79,7 @@ class PromptRead(BaseModel):
     is_folder: bool
     body: Optional[str]
     ai_model: Optional[str]
+    fallback_ai_model: Optional[str]
     created_at: datetime
     updated_at: datetime
 
@@ -90,6 +92,7 @@ class PromptUpdate(BaseModel):
     parent_id: Optional[UUID] = None
     body: Optional[str] = None
     ai_model: Optional[str] = None
+    fallback_ai_model: Optional[str] = None
 
 
 # ── YouTube Channel ──────────────────────────────────────────────────────────
@@ -197,6 +200,7 @@ class AppSettingsRead(BaseModel):
     google_client_id: Optional[str] = None  # Masked for security
     openrouter_rate_limit: int
     channel_request_delay: int = 5
+    max_message_history: int = 1000
     updated_at: Optional[datetime] = None
 
     class Config:
@@ -212,6 +216,7 @@ class AppSettingsUpdate(BaseModel):
     google_client_secret: Optional[str] = None
     openrouter_rate_limit: Optional[int] = None
     channel_request_delay: Optional[int] = None
+    max_message_history: Optional[int] = None
 
 
 # ── Admin Stats ──────────────────────────────────────────────────────────────
@@ -226,3 +231,27 @@ class AdminStatsResponse(BaseModel):
     total_messages: int
     total_channels: int
     total_bots: int
+
+
+# ── User Data Export ─────────────────────────────────────────────────────────
+
+class UserDataExport(BaseModel):
+    """Complete export of user's prompts and channel subscriptions."""
+    exported_at: datetime
+    email: str
+    prompts: list[PromptRead]
+    channels: list[YouTubeChannelRead]
+
+
+class UserDataImport(BaseModel):
+    """Import payload for user's prompts and channel subscriptions."""
+    prompts: list[PromptCreate] = []
+    channels: list[YouTubeChannelCreate] = []
+
+
+class ImportResult(BaseModel):
+    """Result of a data import operation."""
+    prompts_imported: int
+    channels_imported: int
+    prompts_skipped: int
+    channels_skipped: int

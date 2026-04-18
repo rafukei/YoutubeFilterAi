@@ -34,7 +34,8 @@ export default function ChannelsPage() {
     setChannels(channelsRes.data)
     const all = promptsRes.data as Prompt[]
     setAllPrompts(all)
-    setPrompts(all.filter((p: Prompt) => !p.is_folder))
+    // Include both prompts and folders — folders run all child prompts
+    setPrompts(all)
   }
   useEffect(() => { load() }, [])
 
@@ -153,13 +154,14 @@ export default function ChannelsPage() {
                   </div>
                 </div>
               } />
-              <GuideStep number={3} title="Link to a prompt" content={
+              <GuideStep number={3} title="Link to a prompt or folder" content={
                 <div className="space-y-2">
                   <p>Choose which prompt processes this channel's videos:</p>
                   <ul className="list-disc list-inside space-y-1 text-gray-400">
-                    <li>Different channels can use different prompts</li>
+                    <li>Select a <strong>single prompt</strong> to run one AI analysis per video</li>
+                    <li>Select a <strong>folder</strong> to run ALL prompts inside it against each video</li>
+                    <li>Different channels can use different prompts/folders</li>
                     <li>The prompt defines the AI model and routing</li>
-                    <li>You can change the prompt anytime</li>
                   </ul>
                   <div className="mt-2 p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-lg">
                     <p className="text-sm text-yellow-200"><strong>⚠️ Note:</strong> Create a prompt on the "Prompts" page before adding a channel.</p>
@@ -206,8 +208,8 @@ export default function ChannelsPage() {
               <label className="block text-sm font-medium text-gray-300 mb-1">Prompt to use</label>
               <select className="w-full bg-gray-700 border border-gray-600 rounded-lg px-3 py-2 text-gray-100 focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
                 value={selectedPrompt} onChange={e => setSelectedPrompt(e.target.value)}>
-                <option value="">-- Select prompt --</option>
-                {prompts.map(p => <option key={p.id} value={p.id}>{getPromptPath(p.id)}</option>)}
+                <option value="">-- Select prompt or folder --</option>
+                {prompts.map(p => <option key={p.id} value={p.id}>{p.is_folder ? '📁 ' : '📝 '}{getPromptPath(p.id)}</option>)}
               </select>
             </div>
           </div>
@@ -256,7 +258,7 @@ export default function ChannelsPage() {
                               defaultValue={c.prompt_id || ''}
                               onChange={e => updateChannel(c.id, { prompt_id: e.target.value || null })}>
                               <option value="">-- Not selected --</option>
-                              {prompts.map(p => <option key={p.id} value={p.id}>{getPromptPath(p.id)}</option>)}
+                              {prompts.map(p => <option key={p.id} value={p.id}>{p.is_folder ? '📁 ' : '📝 '}{getPromptPath(p.id)}</option>)}
                             </select>
                           </div>
                         </div>

@@ -4,6 +4,7 @@ OpenRouter AI client with rate-limiting for free-tier usage.
 Functions:
     query_ai(prompt: str, transcript: str, api_token: str) -> str
     get_available_models(api_token: str) -> list[dict]
+    resolve_folder_prompts(prompt_id, user_id, db) -> list[Prompt]
 
 The rate limiter uses Redis to track per-user request counts and
 prevents exceeding OPENROUTER_FREE_RPM (requests per minute).
@@ -11,9 +12,12 @@ prevents exceeding OPENROUTER_FREE_RPM (requests per minute).
 
 import json
 from typing import Optional, List
+from uuid import UUID
 
 import httpx
 import redis.asyncio as aioredis
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 
@@ -106,8 +110,12 @@ async def query_ai(
     user_id: str,
     redis_client: aioredis.Redis,
     model: str = "openai/gpt-3.5-turbo",
+    fallback_model: Optional[str] = None,
 ) -> str:
     """Send a prompt + transcript to OpenRouter and return the AI response.
+
+    If the primary model fails due to context length or capacity issues and
+    a fallback_model is configured, automatically retries with the fallback.
 
     Args:
         prompt: The user's prompt template (must include routing JSON block).
@@ -115,51 +123,99 @@ async def query_ai(
         api_token: User's personal OpenRouter API token.
         user_id: For rate-limit tracking.
         redis_client: Async Redis connection.
-        model: OpenRouter model identifier.
+        model: OpenRouter model identifier (primary).
+        fallback_model: Optional fallback model if primary fails on capacity/context.
 
     Returns:
         The AI-generated response text.
 
     Raises:
-        RuntimeError: On rate limit or API errors.
+        RuntimeError: On rate limit or API errors (after fallback exhausted).
     """
     await _check_rate_limit(user_id, redis_client)
 
     full_prompt = f"{prompt}\n\n--- VIDEO TRANSCRIPT ---\n{transcript}"
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(
-            f"{settings.OPENROUTER_BASE_URL}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_token}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You process YouTube video transcripts according to user instructions."},
-                    {"role": "user", "content": full_prompt},
-                ],
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
+    # Errors that indicate the primary model can't handle the input
+    _FALLBACK_KEYWORDS = (
+        "context_length", "context length", "too long", "token limit",
+        "max_tokens", "capacity", "overloaded", "503", "model_not_available",
+    )
+
+    async def _call_model(chosen_model: str) -> str:
+        """Make a single OpenRouter API call with the given model."""
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                f"{settings.OPENROUTER_BASE_URL}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_token}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": chosen_model,
+                    "messages": [
+                        {"role": "system", "content": (
+                        "You process YouTube video transcripts according to user instructions. "
+                        "IMPORTANT: The JSON routing block at the end of the user's prompt defines where to send results. "
+                        "You MUST always preserve the telegram_bots and web_views arrays exactly as given. "
+                        "The 'visibility' field controls ALL delivery: when false, the message is stored but NOT sent to Telegram or shown on web."
+                    )},
+                        {"role": "user", "content": full_prompt},
+                    ],
+                },
+            )
+            if response.status_code >= 400:
+                # Read the error body for a meaningful message
+                try:
+                    err_body = response.json()
+                    err_msg = err_body.get("error", {}).get("message", "") or str(err_body)
+                except Exception:
+                    err_msg = response.text[:500]
+                raise RuntimeError(
+                    f"OpenRouter API error {response.status_code} (model: {chosen_model}): {err_msg}"
+                )
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+
+    # Try primary model
+    try:
+        return await _call_model(model)
+    except Exception as primary_err:
+        err_str = str(primary_err).lower()
+        if fallback_model and any(kw in err_str for kw in _FALLBACK_KEYWORDS):
+            # Primary failed on capacity/context — try fallback
+            # Check rate limit again for the second call
+            await _check_rate_limit(user_id, redis_client)
+            try:
+                return await _call_model(fallback_model)
+            except Exception as fallback_err:
+                raise RuntimeError(
+                    f"Both models failed. Primary ({model}): {primary_err}; "
+                    f"Fallback ({fallback_model}): {fallback_err}"
+                )
+        raise
 
 
-def parse_ai_routing(ai_response: str) -> dict:
+def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None) -> dict:
     """Extract the JSON routing block from the end of an AI response.
 
     The prompt instructs the AI to append a JSON block like:
-        {"message": "...", "telegram_bots": [...], "web_views": [...], "visibility": true}
+        {"message": "...", "telegram_bots": ["bot_name"], "web_views": ["view_name"], "visibility": true}
+
+    If the AI omits routing fields (e.g. telegram_bots), the original prompt's
+    routing block is used as fallback to ensure delivery targets are preserved.
 
     Args:
         ai_response: Full AI response text.
+        prompt_routing: Optional dict parsed from the prompt's own routing JSON.
+            Used as fallback for telegram_bots / web_views if AI omits them.
 
     Returns:
         Parsed dict with keys: message, telegram_bots, web_views, visibility.
         Falls back to defaults if JSON is missing.
     """
+    prompt_routing = prompt_routing or {}
+
     # Try to find the last JSON object in the response
     try:
         last_brace = ai_response.rfind("}")
@@ -168,6 +224,11 @@ def parse_ai_routing(ai_response: str) -> dict:
             candidate = ai_response[first_brace : last_brace + 1]
             parsed = json.loads(candidate)
             if "message" in parsed:
+                # Merge: use prompt's routing targets as fallback if AI dropped them
+                if not parsed.get("telegram_bots") and prompt_routing.get("telegram_bots"):
+                    parsed["telegram_bots"] = prompt_routing["telegram_bots"]
+                if not parsed.get("web_views") and prompt_routing.get("web_views"):
+                    parsed["web_views"] = prompt_routing["web_views"]
                 return parsed
     except (json.JSONDecodeError, ValueError):
         pass
@@ -179,3 +240,50 @@ def parse_ai_routing(ai_response: str) -> dict:
         "web_views": [],
         "visibility": True,
     }
+
+
+async def resolve_folder_prompts(
+    prompt_id: UUID,
+    user_id: UUID,
+    db: AsyncSession,
+) -> list:
+    """Resolve a prompt_id to a list of executable prompts.
+
+    If the prompt is a regular prompt, returns it in a single-element list.
+    If it's a folder, returns all non-folder child prompts (recursive).
+
+    Args:
+        prompt_id: UUID of the prompt or folder.
+        user_id: Owner UUID (security check).
+        db: Async database session.
+
+    Returns:
+        List of Prompt ORM objects that have a non-empty body.
+    """
+    from app.models import Prompt  # local import to avoid circular
+
+    result = await db.execute(
+        select(Prompt).where(Prompt.id == prompt_id, Prompt.user_id == user_id)
+    )
+    prompt = result.scalar_one_or_none()
+    if not prompt:
+        return []
+
+    if not prompt.is_folder:
+        return [prompt] if prompt.body else []
+
+    # Recursively collect all child prompts from this folder
+    collected: list = []
+
+    async def _collect_children(parent_id: UUID) -> None:
+        children_result = await db.execute(
+            select(Prompt).where(Prompt.parent_id == parent_id, Prompt.user_id == user_id)
+        )
+        for child in children_result.scalars().all():
+            if child.is_folder:
+                await _collect_children(child.id)
+            elif child.body:
+                collected.append(child)
+
+    await _collect_children(prompt_id)
+    return collected
