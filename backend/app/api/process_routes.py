@@ -127,18 +127,22 @@ async def process_video(
                     select(WebView).where(WebView.user_id == user.id, WebView.name == view_name)
                 )
                 wv = wv_result.scalar_one_or_none()
-                if wv:
-                    msg = Message(
-                        user_id=user.id,
-                        web_view_id=wv.id,
-                        prompt_id=prompt_id,
-                        source_video_url=source_url,
-                        transcript_text=transcript,
-                        ai_response=routing.get("message", ai_response),
-                        visibility=routing.get("visibility", True),
-                    )
-                    db.add(msg)
-                    messages_created.append(msg)
+                if not wv:
+                    wv = WebView(user_id=user.id, name=view_name)
+                    db.add(wv)
+                    await db.flush()
+                    await db.refresh(wv)
+                msg = Message(
+                    user_id=user.id,
+                    web_view_id=wv.id,
+                    prompt_id=prompt_id,
+                    source_video_url=source_url,
+                    transcript_text=transcript,
+                    ai_response=routing.get("message", ai_response),
+                    visibility=routing.get("visibility", True),
+                )
+                db.add(msg)
+                messages_created.append(msg)
         else:
             msg = Message(
                 user_id=user.id,

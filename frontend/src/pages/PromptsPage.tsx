@@ -70,6 +70,8 @@ export default function PromptsPage() {
   const [testVideoUrl, setTestVideoUrl] = useState('')
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<{ transcript?: string; response?: string; fullPrompt?: string; error?: string } | null>(null)
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
 
   const load = async () => {
     const [promptsRes, modelsRes] = await Promise.all([
@@ -166,6 +168,19 @@ export default function PromptsPage() {
     if (selected?.id === id) setSelected(null)
   }
 
+  const startRename = (p: Prompt) => {
+    setRenamingId(p.id)
+    setRenameValue(p.name)
+  }
+
+  const commitRename = async () => {
+    if (!renamingId || !renameValue.trim()) { setRenamingId(null); return }
+    await api.patch('/prompts/' + renamingId, { name: renameValue.trim() })
+    setRenamingId(null)
+    setRenameValue('')
+    load()
+  }
+
   const applyTemplate = (template: typeof PROMPT_TEMPLATES[0]) => {
     setBody(template.body)
     setRoutingJson(JSON.stringify(template.routing, null, 2))
@@ -206,15 +221,26 @@ export default function PromptsPage() {
           <div className={'flex items-center gap-2 py-1.5 px-2 rounded cursor-pointer transition ' +
             (selected?.id === p.id ? 'bg-indigo-600/30' : activeFolder === p.id ? 'bg-indigo-900/20 ring-1 ring-indigo-500/30' : 'hover:bg-gray-700/50')
           }>
-            <span className="flex-1 text-gray-300" onClick={() => {
-              if (p.is_folder) {
-                setActiveFolder(activeFolder === p.id ? null : p.id)
-              } else {
-                select(p)
-              }
-            }}>
-              {p.is_folder ? (activeFolder === p.id ? '📂' : '📁') : '📝'} {p.name}
-            </span>
+            {renamingId === p.id ? (
+              <input
+                autoFocus
+                className="flex-1 bg-gray-700 border border-indigo-500 rounded px-1 py-0.5 text-sm text-gray-100 focus:outline-none"
+                value={renameValue}
+                onChange={e => setRenameValue(e.target.value)}
+                onBlur={() => commitRename()}
+                onKeyDown={e => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setRenamingId(null) }}
+              />
+            ) : (
+              <span className="flex-1 text-gray-300" onClick={() => {
+                if (p.is_folder) {
+                  setActiveFolder(activeFolder === p.id ? null : p.id)
+                } else {
+                  select(p)
+                }
+              }} onDoubleClick={(e) => { e.stopPropagation(); startRename(p) }}>
+                {p.is_folder ? (activeFolder === p.id ? '📂' : '📁') : '📝'} {p.name}
+              </span>
+            )}
             <button onClick={(e) => { e.stopPropagation(); del(p.id) }}
               className="text-xs text-red-400 hover:text-red-300 opacity-50 hover:opacity-100">✕</button>
           </div>

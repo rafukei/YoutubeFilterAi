@@ -37,6 +37,12 @@ async def lifespan(app: FastAPI):
     # Create tables (dev convenience – use Alembic migrations in production)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Add missing columns for schema upgrades (safe: IF NOT EXISTS)
+        await conn.execute(
+            __import__("sqlalchemy").text(
+                "ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS max_message_history INTEGER DEFAULT 1000"
+            )
+        )
     # Start background scheduler
     app.state.scheduler_task = asyncio.create_task(scheduler_loop(app.state.redis))
     yield
