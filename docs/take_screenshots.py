@@ -113,15 +113,17 @@ async def main():
         await page2.fill('input[placeholder="Admin username"]', ADMIN_USER)
         await page2.fill('input[type="password"]', ADMIN_PASS)
         await page2.click('button[type="submit"]')
-        await page2.wait_for_timeout(2500)
+        await page2.wait_for_timeout(3000)
 
-        # 10. Admin users page
+        # 10. Admin users page — wait for table/content to load
+        await page2.goto(f"{BASE}/admin/users")
+        await page2.wait_for_timeout(3000)
         await screenshot(page2, f"{OUT}/07_admin_users.png")
         print("✓ Admin users page")
 
         # 11. Admin settings page
         await page2.goto(f"{BASE}/admin/settings")
-        await page2.wait_for_timeout(2000)
+        await page2.wait_for_timeout(3000)
         await screenshot(page2, f"{OUT}/08_admin_settings.png", full=True)
         print("✓ Admin settings page")
 
