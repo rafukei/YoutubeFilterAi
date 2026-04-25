@@ -68,7 +68,7 @@ class PromptCreate(BaseModel):
     parent_id: Optional[UUID] = None
     is_folder: bool = False
     body: Optional[str] = None
-    ai_model: Optional[str] = "openai/gpt-3.5-turbo"
+    ai_model: Optional[str] = "openai/gpt-4.1-mini"
     fallback_ai_model: Optional[str] = None
 
 
@@ -255,3 +255,18 @@ class ImportResult(BaseModel):
     channels_imported: int
     prompts_skipped: int
     channels_skipped: int
+
+
+# ── Activity Logs ────────────────────────────────────────────────────────────
+
+class ActivityLogRead(BaseModel):
+    """Single activity log entry."""
+    id: UUID
+    level: str
+    source: str
+    message: str
+    details: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

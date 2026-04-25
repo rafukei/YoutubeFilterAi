@@ -8,6 +8,7 @@ DELETE /api/messages/{id}           – delete a message
 """
 
 import asyncio
+import logging
 from uuid import UUID
 
 import redis.asyncio as aioredis
@@ -21,6 +22,9 @@ from app.models import Message, Prompt, TelegramBot, WebView, User
 from app.schemas import MessageRead, ProcessVideoRequest, ProcessVideoResponse
 from app.services import extract_video_id, fetch_transcript
 from app.services.ai_service import parse_ai_routing, query_ai, resolve_folder_prompts
+from app.services.log_service import log_activity
+
+logger = logging.getLogger(__name__)
 from app.services.telegram_service import send_telegram_message
 
 router = APIRouter(prefix="/api", tags=["processing"])
@@ -74,9 +78,9 @@ async def process_video(
         if not resolved:
             raise HTTPException(404, "Prompt/folder not found or contains no executable prompts")
         for p in resolved:
-            prompts_to_run.append((p.body, p.ai_model or "openai/gpt-3.5-turbo", p.fallback_ai_model, p.id))
+            prompts_to_run.append((p.body, p.ai_model or "openai/gpt-4.1-mini", p.fallback_ai_model, p.id))
     elif body.prompt_text:
-        prompts_to_run.append((body.prompt_text, "openai/gpt-3.5-turbo", None, None))
+        prompts_to_run.append((body.prompt_text, "openai/gpt-4.1-mini", None, None))
     else:
         raise HTTPException(400, "Provide prompt_id or prompt_text")
 
@@ -86,6 +90,7 @@ async def process_video(
         transcript = fetch_transcript(video_id)
     except Exception as e:
         err = str(e).lower()
+        await log_activity(db, user.id, "ERROR", "transcript", f"Failed to fetch transcript for {video_id}: {e}")
         if "no subtitles" in err or "no transcript" in err:
             raise HTTPException(
                 400,
@@ -95,6 +100,7 @@ async def process_video(
         raise HTTPException(400, f"Could not fetch video transcript: {e}")
 
     source_url = f"https://www.youtube.com/watch?v={video_id}"
+    await log_activity(db, user.id, "INFO", "transcript", f"Fetched transcript for {video_id} ({len(transcript)} chars)")
     all_messages_created = []
 
     # 3. Process each prompt against the transcript (with delay between calls)
@@ -103,6 +109,12 @@ async def process_video(
             await asyncio.sleep(2)  # Rate-limit delay between AI calls
 
         try:
+            # Debug: log which model and prompt are about to be used
+            prompt_id_debug = str(prompt_id) if prompt_id else "<ad-hoc>"
+            logger.info("AI call: user=%s prompt_id=%s model=%s fallback=%s prompt_len=%s transcript_chars=%d",
+                        str(user.id), prompt_id_debug, ai_model, fallback_model, len(prompt_text) if prompt_text else "N/A", len(transcript))
+            await log_activity(db, user.id, "DEBUG", "ai", f"Calling query_ai prompt_id={prompt_id_debug} model={ai_model} fallback={fallback_model} transcript_chars={len(transcript)}")
+
             ai_response = await query_ai(
                 prompt=prompt_text,
                 transcript=transcript,
@@ -113,7 +125,10 @@ async def process_video(
                 fallback_model=fallback_model,
             )
         except RuntimeError as e:
+            await log_activity(db, user.id, "ERROR", "ai", f"AI query failed (model={ai_model}): {e}")
             raise HTTPException(502, str(e))
+
+        await log_activity(db, user.id, "INFO", "ai", f"AI response received (model={ai_model}, {len(ai_response)} chars)")
 
         # Parse the prompt's own routing JSON to use as fallback
         prompt_routing = parse_ai_routing(prompt_text) if prompt_text else {}
@@ -165,15 +180,28 @@ async def process_video(
             )
             for bot in bots_result.scalars():
                 if bot.chat_id:
-                    sent = await send_telegram_message(
-                        bot_token=bot.bot_token,
-                        chat_id=bot.chat_id,
-                        text=routing.get("message", ai_response),
-                        video_url=source_url,
-                    )
+                    try:
+                        sent = await send_telegram_message(
+                            bot_token=bot.bot_token,
+                            chat_id=bot.chat_id,
+                            text=routing.get("message", ai_response),
+                            video_url=source_url,
+                        )
+                    except Exception as e:
+                        # Network or HTTP client errors can happen — record
+                        # them in activity logs but don't raise an exception
+                        # that would abort the surrounding DB work and return
+                        # a 502 to the caller.
+                        await log_activity(db, user.id, "ERROR", "telegram",
+                                           f"Failed to send via bot '{bot.bot_name}': {e}")
+                        sent = False
+
                     if sent:
                         for m in messages_created:
                             m.sent_to_telegram = True
+                        await log_activity(db, user.id, "INFO", "telegram", f"Message sent via bot '{bot.bot_name}'")
+                    else:
+                        await log_activity(db, user.id, "WARNING", "telegram", f"Failed to send via bot '{bot.bot_name}'")
 
         all_messages_created.extend(messages_created)
 

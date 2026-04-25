@@ -60,7 +60,7 @@ export default function PromptsPage() {
   const [body, setBody] = useState('')
   const [routingJson, setRoutingJson] = useState(JSON.stringify(DEFAULT_ROUTING, null, 2))
   const [jsonError, setJsonError] = useState<string | null>(null)
-  const [aiModel, setAiModel] = useState('openai/gpt-3.5-turbo')
+  const [aiModel, setAiModel] = useState('openai/gpt-4.1-mini')
   const [fallbackModel, setFallbackModel] = useState<string | null>(null)
   const [newName, setNewName] = useState('')
   const [activeFolder, setActiveFolder] = useState<string | null>(null)
@@ -112,7 +112,7 @@ export default function PromptsPage() {
   const select = (p: Prompt) => {
     setSelected(p)
     parseBodyAndRouting(p.body)
-    setAiModel(p.ai_model || 'openai/gpt-3.5-turbo')
+    setAiModel(p.ai_model || 'openai/gpt-4.1-mini')
     setFallbackModel(p.fallback_ai_model || null)
     setTestResult(null)
     setTestVideoUrl('')
@@ -155,7 +155,7 @@ export default function PromptsPage() {
       name: newName, is_folder: isFolder,
       parent_id: activeFolder || null,
       body: isFolder ? null : '',
-      ai_model: isFolder ? null : 'openai/gpt-3.5-turbo'
+      ai_model: isFolder ? null : 'openai/gpt-4.1-mini'
     })
     setNewName('')
     load()

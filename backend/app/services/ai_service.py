@@ -1,13 +1,19 @@
-"""
-OpenRouter AI client with rate-limiting for free-tier usage.
+"""OpenRouter AI client with rate-limiting and helper utilities.
 
-Functions:
-    query_ai(prompt: str, transcript: str, api_token: str) -> str
-    get_available_models(api_token: str) -> list[dict]
-    resolve_folder_prompts(prompt_id, user_id, db) -> list[Prompt]
+This module provides a small wrapper around OpenRouter's chat/completions
+API including:
 
-The rate limiter uses Redis to track per-user request counts and
-prevents exceeding OPENROUTER_FREE_RPM (requests per minute).
+- Model discovery: ``get_available_models`` fetches available models (with a
+    curated fallback list in ``DEFAULT_MODELS``).
+- Per-user free-tier rate limiting enforced by Redis: ``_check_rate_limit``.
+- A higher-level ``query_ai`` which sends a prompt + transcript to OpenRouter,
+    optionally retries a fallback model on capacity/context errors, and returns
+    the AI text output.
+- Helpers to parse the JSON routing block appended by the AI (``parse_ai_routing``)
+    and to resolve prompt folders to leaf prompts (``resolve_folder_prompts``).
+
+All functions follow the project's docstring style (Args, Returns, Raises).
+The rate limiter uses the ``OPENROUTER_FREE_RPM`` setting (env) by default.
 """
 
 import json
@@ -18,12 +24,19 @@ import httpx
 import redis.asyncio as aioredis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+import logging
 
 from app.config import get_settings
 
 settings = get_settings()
 
-# Popular free and paid models on OpenRouter (fallback list)
+logger = logging.getLogger(__name__)
+
+# Popular free and paid models on OpenRouter (fallback list).
+# Each entry contains an `id` matching OpenRouter, a human-friendly `name`,
+# an estimated `context_length` (tokens), a small `pricing` hint and a short
+# `description`. This list is used as a fallback when the OpenRouter models
+# endpoint is unreachable.
 DEFAULT_MODELS = [
     {"id": "openai/gpt-3.5-turbo", "name": "GPT-3.5 Turbo", "context_length": 16385, "pricing": {"prompt": 0.0005, "completion": 0.0015}, "description": "Fast and affordable, great for summaries"},
     {"id": "openai/gpt-4o-mini", "name": "GPT-4o Mini", "context_length": 128000, "pricing": {"prompt": 0.00015, "completion": 0.0006}, "description": "Excellent balance of speed and quality"},
@@ -41,12 +54,21 @@ DEFAULT_MODELS = [
 async def get_available_models(api_token: Optional[str] = None) -> List[dict]:
     """Fetch available models from OpenRouter API.
 
+    This function queries OpenRouter's `/models` endpoint. If the network
+    request fails or the API is unavailable, a curated fallback list defined
+    in ``DEFAULT_MODELS`` is returned so the UI can still present choices.
+
     Args:
-        api_token: Optional API token for authenticated requests.
+        api_token: Optional API token for authenticated requests. If provided
+            it is added to the Authorization header.
 
     Returns:
-        List of model dictionaries with id, name, context_length, pricing, description.
-        Falls back to curated default list on API failure.
+        A list of model dictionaries. Each dict contains keys: ``id``,
+        ``name``, ``context_length``, ``pricing`` and ``description``.
+
+    Raises:
+        None: network/API errors are swallowed and the fallback list is
+        returned to keep the caller simple.
     """
     try:
         headers = {"Content-Type": "application/json"}
@@ -83,6 +105,11 @@ async def get_available_models(api_token: Optional[str] = None) -> List[dict]:
 async def _check_rate_limit(user_id: str, redis_client: aioredis.Redis) -> None:
     """Enforce per-user rate limit for OpenRouter calls.
 
+    The implementation stores a per-user counter in Redis with a 60-second
+    expiry (sliding window). If the counter is >= ``settings.OPENROUTER_FREE_RPM``
+    a ``RuntimeError`` is raised and the caller should surface that to the
+    user (HTTP 429/502-equivalent behavior in the API handlers).
+
     Args:
         user_id: UUID string identifying the user.
         redis_client: Async Redis connection.
@@ -109,30 +136,50 @@ async def query_ai(
     api_token: str,
     user_id: str,
     redis_client: aioredis.Redis,
-    model: str = "openai/gpt-3.5-turbo",
+    model: str = "openai/gpt-4.1-mini",
     fallback_model: Optional[str] = None,
 ) -> str:
     """Send a prompt + transcript to OpenRouter and return the AI response.
 
-    If the primary model fails due to context length or capacity issues and
-    a fallback_model is configured, automatically retries with the fallback.
+    This is the main entrypoint used by the processing pipeline. It performs
+    the following high-level steps:
+    1. Enforces per-user rate limit via ``_check_rate_limit``.
+    2. Sends the prompt + transcript to the chosen OpenRouter model.
+    3. If the model responds with an error that looks like a capacity or
+       context-length issue and a ``fallback_model`` is provided, the call
+       is retried once using the fallback model (rate limit is re-checked).
 
     Args:
-        prompt: The user's prompt template (must include routing JSON block).
-        transcript: Raw YouTube transcript text.
-        api_token: User's personal OpenRouter API token.
-        user_id: For rate-limit tracking.
-        redis_client: Async Redis connection.
-        model: OpenRouter model identifier (primary).
-        fallback_model: Optional fallback model if primary fails on capacity/context.
+        prompt: The user's prompt template (string). In this application the
+            prompt is expected to end with a JSON routing block that the AI
+            should echo back (telegram_bots, web_views, visibility).
+        transcript: Raw YouTube transcript text to be appended to the prompt.
+        api_token: User's personal OpenRouter API token used for Authorization.
+        user_id: User UUID string used for per-user rate limiting in Redis.
+        redis_client: Async Redis client instance used by the rate limiter.
+        model: Primary OpenRouter model identifier (e.g. "openai/gpt-3.5-turbo").
+        fallback_model: Optional fallback model to try when the primary fails
+            on capacity/context errors.
 
     Returns:
-        The AI-generated response text.
+        The AI-generated response text (string) from the chosen model.
 
     Raises:
-        RuntimeError: On rate limit or API errors (after fallback exhausted).
+        RuntimeError: If the user is rate-limited, or if OpenRouter returns an
+            error for both primary and fallback models. The error message
+            includes the model id and the upstream error body when available.
     """
     await _check_rate_limit(user_id, redis_client)
+
+    # Debug: log incoming call parameters so we can trace which model is used
+    try:
+        prompt_len = len(prompt) if prompt else 0
+        transcript_chars = len(transcript) if transcript else 0
+    except Exception:
+        prompt_len = 0
+        transcript_chars = 0
+    logger.debug("query_ai called: user=%s model=%s fallback=%s prompt_len=%d transcript_chars=%d",
+                 user_id, model, fallback_model, prompt_len, transcript_chars)
 
     full_prompt = f"{prompt}\n\n--- VIDEO TRANSCRIPT ---\n{transcript}"
 
@@ -143,7 +190,49 @@ async def query_ai(
     )
 
     async def _call_model(chosen_model: str) -> str:
-        """Make a single OpenRouter API call with the given model."""
+        """Make a single OpenRouter API call with the given model.
+
+        Args:
+            chosen_model: Model id to request from OpenRouter.
+
+        Returns:
+            The response body string from the model (assistant content).
+
+        Raises:
+            RuntimeError: If OpenRouter responds with a non-2xx status code
+                or if the response JSON cannot be parsed into the expected
+                structure.
+        """
+        # Log the outgoing model and approximate token estimate for debugging
+        try:
+            approx_tokens = int(len(full_prompt) / 4)
+        except Exception:
+            approx_tokens = 0
+        # Try to find a known context length for the chosen model so we can
+        # pre-flight reject or switch to a fallback before sending to OpenRouter.
+        model_info = next((m for m in DEFAULT_MODELS if m.get("id") == chosen_model), None)
+        if model_info and model_info.get("context_length"):
+            if approx_tokens > int(model_info["context_length"]):
+                # If a fallback model is provided and it can handle the input,
+                # use it instead of calling the undersized model.
+                fb_info = next((m for m in DEFAULT_MODELS if m.get("id") == fallback_model), None) if fallback_model else None
+                if fb_info and approx_tokens <= int(fb_info.get("context_length", 0)):
+                    logger.warning(
+                        "Estimated tokens (%d) exceed model %s context (%d) — switching to fallback %s",
+                        approx_tokens, chosen_model, model_info["context_length"], fallback_model,
+                    )
+                    chosen_model = fallback_model
+                else:
+                    # No adequate fallback: raise a clear error so the API can
+                    # return a 400 with an actionable message instead of a
+                    # 502 from an upstream 400.
+                    raise RuntimeError(
+                        f"Estimated prompt size ({approx_tokens} tokens) exceeds the context length for model {chosen_model} ({model_info['context_length']} tokens). "
+                        "Choose a model with a larger context window (e.g. openai/gpt-4o-mini) or shorten the transcript."
+                    )
+
+        logger.info("OpenRouter request: user=%s model=%s approx_prompt_tokens=%d", user_id, chosen_model, approx_tokens)
+
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 f"{settings.OPENROUTER_BASE_URL}/chat/completions",
@@ -211,8 +300,15 @@ def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None) -> di
             Used as fallback for telegram_bots / web_views if AI omits them.
 
     Returns:
-        Parsed dict with keys: message, telegram_bots, web_views, visibility.
-        Falls back to defaults if JSON is missing.
+        A dict with keys: ``message`` (string), ``telegram_bots`` (list),
+        ``web_views`` (list) and ``visibility`` (bool). If the AI did not
+        append a valid JSON object with a ``message`` key, the entire AI
+        response is returned as the ``message`` and arrays/defaults are used
+        for the other fields.
+
+    Raises:
+        None: parsing failures are handled gracefully and a sensible fallback
+        dict is returned.
     """
     prompt_routing = prompt_routing or {}
 
@@ -258,7 +354,11 @@ async def resolve_folder_prompts(
         db: Async database session.
 
     Returns:
-        List of Prompt ORM objects that have a non-empty body.
+        A list of Prompt ORM objects (leaf prompts with a non-empty ``body``).
+
+    Raises:
+        None: If the referenced prompt does not exist or the folder is empty
+        an empty list is returned.
     """
     from app.models import Prompt  # local import to avoid circular
 
