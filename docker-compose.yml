@@ -16,12 +16,22 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ytfilter"]
       interval: 5s
       retries: 5
+    mem_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   # ── Redis ─────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          memory: 256m
 
   # ── Backend (FastAPI) ─────────────────────────────────
   backend:
@@ -37,16 +47,27 @@ services:
     volumes:
       - ./backend:/app  # live reload in dev
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    mem_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   # ── Frontend (React / Vite) ──────────────────────────
   frontend:
     build: ./frontend
     ports:
       - "5173:5173"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-    command: npm run dev -- --host 0.0.0.0
+    environment:
+      - NODE_OPTIONS=--max-old-space-size=256
+    # Vite dev server is memory-intensive; bind-mount overwrites source,
+      # so we run the pre-built static files via nginx instead when in prod.
+      # For dev, increase memory tolerance.
+    mem_limit: 512m
+    deploy:
+      resources:
+        limits:
+          memory: 512m
 
   # ── NGINX reverse proxy ──────────────────────────────
   nginx:
@@ -58,6 +79,11 @@ services:
     depends_on:
       - backend
       - frontend
+    mem_limit: 128m
+    deploy:
+      resources:
+        limits:
+          memory: 128m
 
 volumes:
   pgdata:

@@ -19,6 +19,7 @@ export default function Layout({ onLogout, isAdmin }: LayoutProps) {
         { to: '/prompts', label: 'Prompts', icon: '📝' },
         { to: '/channels', label: 'Channels', icon: '📺' },
         { to: '/bots', label: 'Telegram', icon: '🤖' },
+        { to: '/logs', label: 'Logs', icon: '📜' },
         { to: '/settings', label: 'Settings', icon: '⚙️' },
       ]
 

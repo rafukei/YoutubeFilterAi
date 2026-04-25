@@ -3,6 +3,11 @@ CRUD endpoints for user resources: prompts, channels, telegram bots, web views.
 
 All endpoints require a valid JWT (get_current_user dependency).
 """
+"""
+CRUD endpoints for user resources: prompts, channels, telegram bots, web views.
+
+All endpoints require a valid JWT (get_current_user dependency).
+"""
 
 from uuid import UUID
 from typing import List
@@ -13,17 +18,52 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import Prompt, YouTubeChannel, TelegramBot, WebView, User
+from app.models import Prompt, YouTubeChannel, TelegramBot, WebView, User, ActivityLog
 from app.schemas import (
     PromptCreate, PromptRead, PromptUpdate,
     YouTubeChannelCreate, YouTubeChannelRead, YouTubeChannelUpdate,
     TelegramBotCreate, TelegramBotRead,
     WebViewCreate, WebViewRead,
     UserDataExport, UserDataImport, ImportResult,
+    ActivityLogRead,
 )
 from app.services.ai_service import get_available_models
 
 router = APIRouter(prefix="/api", tags=["resources"])
+
+
+# ── Activity Logs ────────────────────────────────────────────────────────────
+
+
+@router.get("/logs", response_model=list[ActivityLogRead])
+async def get_logs(
+    level: str = None,
+    source: str = None,
+    limit: int = 100,
+    offset: int = 0,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return recent activity logs for the current user, newest first.
+
+    Args:
+        level: Optional log level filter (INFO, ERROR, etc)
+        source: Optional source filter (ai, telegram, etc)
+        limit: Max results (default 100)
+        offset: For pagination
+        user: Current user
+        db: DB session
+    Returns:
+        List of ActivityLogRead
+    """
+    q = select(ActivityLog).where(ActivityLog.user_id == user.id)
+    if level:
+        q = q.where(ActivityLog.level == level.upper())
+    if source:
+        q = q.where(ActivityLog.source == source)
+    q = q.order_by(ActivityLog.created_at.desc()).offset(offset).limit(limit)
+    result = await db.execute(q)
+    return result.scalars().all()
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────

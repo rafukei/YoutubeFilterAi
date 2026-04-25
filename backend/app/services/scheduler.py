@@ -22,6 +22,7 @@ from app.database import async_session as async_session_factory
 from app.models import YouTubeChannel, TelegramBot, WebView, Message, User
 from app.services import extract_video_id, fetch_transcript
 from app.services.ai_service import query_ai, parse_ai_routing, resolve_folder_prompts
+from app.services.log_service import log_activity
 from app.services.telegram_service import send_telegram_message
 
 logger = logging.getLogger("scheduler")
@@ -301,7 +302,17 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         logger.info("Resolved %s → %s", channel.channel_id, real_channel_id)
         original_handle = channel.channel_id
         channel.channel_id = real_channel_id
-        await db.commit()
+        try:
+            await db.commit()
+        except Exception as commit_err:
+            # If commit fails (e.g. unique constraint violation from race condition),
+            # roll back and skip this channel gracefully — don't crash the whole loop.
+            await db.rollback()
+            logger.warning(
+                "Channel %s commit failed (%s) — skipping, will retry next cycle",
+                channel.channel_name, commit_err
+            )
+            return
 
     handle_for_fallback = original_handle or channel.channel_name
 
@@ -317,6 +328,8 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         return
 
     logger.info("New video on %s: %s (%s)", channel.channel_name, latest["title"], new_video_id)
+    await log_activity(db, channel.user_id, "INFO", "scheduler",
+                       f"New video on {channel.channel_name}: {latest['title']}")
 
     # Load the user
     user_result = await db.execute(select(User).where(User.id == channel.user_id))
@@ -324,6 +337,8 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
     if not user or not user.openrouter_api_token:
         logger.warning("User %s missing or no API token – skipping", channel.user_id)
         channel.last_checked_at = datetime.utcnow()
+        channel.last_video_id = new_video_id
+        await db.commit()
         return
 
     # Load the prompt(s) — supports both single prompts and folders
@@ -331,6 +346,7 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         logger.warning("Channel %s has no prompt assigned – skipping", channel.channel_name)
         channel.last_checked_at = datetime.utcnow()
         channel.last_video_id = new_video_id
+        await db.commit()
         return
 
     prompts_to_run = await resolve_folder_prompts(channel.prompt_id, channel.user_id, db)
@@ -338,7 +354,15 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         logger.warning("Prompt/folder %s has no executable prompts – skipping", channel.prompt_id)
         channel.last_checked_at = datetime.utcnow()
         channel.last_video_id = new_video_id
+        await db.commit()
         return
+
+    # Mark this video as "in progress" BEFORE transcript fetch so that if the
+    # scheduler crashes/restarts, we don't re-process the same video multiple times.
+    # We only update last_checked_at + last_video_id here; the full commit happens
+    # at the end of process_channel on success.
+    channel.last_video_id = new_video_id
+    channel.last_checked_at = datetime.utcnow()
 
     # Fetch transcript — throttle first to respect YouTube rate limits
     await _throttle_yt()
@@ -349,7 +373,9 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         if any(kw in error_msg for kw in ("blocking", "ip", "blocked", "429", "too many", "rate")):
             raise IPBlockedError(f"Rate limited/IP blocked fetching transcript for {new_video_id}")
         logger.error("Transcript fetch failed for %s: %s", new_video_id, str(e)[:200])
-        channel.last_checked_at = datetime.utcnow()
+        await log_activity(db, channel.user_id, "ERROR", "transcript",
+                           f"Failed to fetch transcript for {new_video_id}: {str(e)[:200]}")
+        # last_video_id is already set above — commit it so we don't re-fetch this video
         await db.commit()
         return
 
@@ -366,10 +392,15 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
         max_retries = 3
         retry_delay = 10
         try:
-            ai_model = prompt.ai_model or "openai/gpt-3.5-turbo"
+            ai_model = prompt.ai_model or "openai/gpt-4.1-mini"
             fallback_model = prompt.fallback_ai_model
             for attempt in range(1, max_retries + 1):
                 try:
+                    # Debug: log which model and prompt are about to be used in scheduler
+                    logger.info("Scheduler AI call: channel=%s user=%s prompt=%s model=%s fallback=%s transcript_chars=%d",
+                                channel.id, str(user.id), prompt.name, ai_model, fallback_model, len(transcript))
+                    await log_activity(db, channel.user_id, "DEBUG", "ai", f"Scheduler calling query_ai prompt={prompt.name} model={ai_model} fallback={fallback_model} transcript_chars={len(transcript)}")
+
                     ai_response = await query_ai(
                         prompt=prompt.body,
                         transcript=transcript,
@@ -389,6 +420,8 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
                         raise
         except Exception as e:
             logger.error("AI query failed for video %s prompt %s: %s", new_video_id, prompt.name, e)
+            await log_activity(db, channel.user_id, "ERROR", "ai",
+                               f"AI failed for {prompt.name}: {str(e)[:200]}")
             continue  # Skip this prompt, try the next one
 
         # Parse routing — use prompt's own routing JSON as fallback
@@ -442,22 +475,39 @@ async def process_channel(channel: YouTubeChannel, db: AsyncSession, redis_clien
                 )
             )
             for bot in bots_result.scalars():
-                if bot.chat_id:
-                    sent = await send_telegram_message(
-                        bot_token=bot.bot_token,
-                        chat_id=bot.chat_id,
-                        text=routing.get("message", ai_response),
-                        video_url=source_url,
-                    )
-                    if sent:
-                        for m in messages_created:
-                            m.sent_to_telegram = True
+                    if bot.chat_id:
+                        try:
+                            sent = await send_telegram_message(
+                                bot_token=bot.bot_token,
+                                chat_id=bot.chat_id,
+                                text=routing.get("message", ai_response),
+                                video_url=source_url,
+                            )
+                        except Exception as e:
+                            # Don't let Telegram/network errors abort DB work —
+                            # log and continue. Messages are already added and
+                            # will be committed. We record the failure in
+                            # activity logs for visibility.
+                            await log_activity(db, channel.user_id, "ERROR", "telegram",
+                                               f"Failed to send via bot '{bot.bot_name}': {e}")
+                            sent = False
+
+                        if sent:
+                            for m in messages_created:
+                                m.sent_to_telegram = True
+                            await log_activity(db, channel.user_id, "INFO", "telegram",
+                                               f"Sent via bot '{bot.bot_name}' for {channel.channel_name}")
+                        else:
+                            await log_activity(db, channel.user_id, "WARNING", "telegram",
+                                               f"Failed to send via bot '{bot.bot_name}' for {channel.channel_name}")
 
         logger.info("Processed prompt '%s' for video %s on channel %s",
                      prompt.name, new_video_id, channel.channel_name)
+        await log_activity(db, channel.user_id, "INFO", "ai",
+                           f"Processed '{prompt.name}' for {channel.channel_name} ({new_video_id})")
 
-    # Update channel state
-    channel.last_video_id = new_video_id
+    # Update channel state — last_video_id was already set before transcript fetch
+    # to guard against scheduler crashes causing duplicate video processing.
     channel.last_checked_at = datetime.utcnow()
     await db.commit()
 
@@ -519,5 +569,11 @@ async def scheduler_loop(redis_client) -> None:
 
         except Exception as e:
             logger.error("Scheduler loop error: %s", e)
+            # Ensure the session is rolled back on any unhandled exception
+            # so the next iteration starts with a clean session.
+            try:
+                await db.rollback()
+            except Exception:
+                pass
 
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)

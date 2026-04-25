@@ -44,6 +44,7 @@ class User(Base):
     telegram_bots = relationship("TelegramBot", back_populates="owner", cascade="all, delete-orphan")
     web_views = relationship("WebView", back_populates="owner", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="owner", cascade="all, delete-orphan")
+    activity_logs = relationship("ActivityLog", back_populates="owner", cascade="all, delete-orphan")
 
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
@@ -62,7 +63,7 @@ class Prompt(Base):
     name = Column(String(200), nullable=False)
     is_folder = Column(Boolean, default=False)
     body = Column(Text, nullable=True)  # null for folders
-    ai_model = Column(String(128), nullable=True, default="openai/gpt-3.5-turbo")  # OpenRouter model ID
+    ai_model = Column(String(128), nullable=True, default="openai/gpt-4.1-mini")  # OpenRouter model ID
     fallback_ai_model = Column(String(128), nullable=True)  # Optional fallback model (e.g. if primary has context limit)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -180,3 +181,23 @@ class AppSettings(Base):
     channel_request_delay = Column(Integer, default=5)  # seconds between YouTube requests
     max_message_history = Column(Integer, default=1000)  # max stored messages per user (0 = unlimited)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ── Activity Logs ────────────────────────────────────────────────────────────
+
+class ActivityLog(Base):
+    """
+    Structured activity log for user-visible monitoring.
+    Tracks key application events: AI calls, Telegram sends, errors, etc.
+    """
+    __tablename__ = "activity_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    level = Column(String(10), nullable=False, default="INFO")  # DEBUG, INFO, WARNING, ERROR
+    source = Column(String(50), nullable=False)  # e.g. "ai", "telegram", "transcript", "scheduler", "auth"
+    message = Column(Text, nullable=False)
+    details = Column(Text, nullable=True)  # optional JSON or extra context
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    owner = relationship("User", back_populates="activity_logs")

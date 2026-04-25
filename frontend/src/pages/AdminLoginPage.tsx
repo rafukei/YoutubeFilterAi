@@ -15,7 +15,8 @@ export default function AdminLoginPage({ onLogin }: Props) {
     try {
       const { data } = await api.post('/admin/login', { username, password })
       onLogin(data.access_token)
-      navigate('/admin/users')
+      // Use replace to avoid history stack issues with immediate navigation
+      navigate('/admin/users', { replace: true })
     } catch { setError('Invalid admin credentials') }
   }
 

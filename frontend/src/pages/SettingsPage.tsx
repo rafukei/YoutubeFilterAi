@@ -231,7 +231,7 @@ export default function SettingsPage() {
                       name: p.name,
                       is_folder: p.is_folder || false,
                       body: p.body || null,
-                      ai_model: p.ai_model || 'openai/gpt-3.5-turbo',
+                      ai_model: p.ai_model || 'openai/gpt-4.1-mini',
                       fallback_ai_model: p.fallback_ai_model || null,
                     })),
                     channels: (data.channels || []).map((c: any) => ({
