@@ -55,6 +55,47 @@ _ip_block_cooldown_until: datetime | None = None
 # block the entire channel indefinitely.
 _TRANSCRIPT_RETRY_MAX = 3
 
+# ── Defensive assertions ─────────────────────────────────────────────────────
+# These are self-healing checks that run at the START of process_channel()
+# to detect and auto-correct stuck states before they become infinite loops.
+
+
+async def _assert_channel_not_stuck(channel_id: UUID, db: AsyncSession, new_video_id: str) -> None:
+    """Defensive check: verify channel is not in a stuck retry state.
+
+    A channel is considered "stuck" if transcript_retry_count > 0 but the
+    last_checked_at is older than _TRANSCRIPT_RETRY_MAX * SCAN_INTERVAL_SECONDS * 2.
+    This would indicate the scheduler crashed mid-retry and the counter was
+    left elevated.
+
+    This is self-healing: if stuck, we log the issue and reset the counter.
+
+    Args:
+        channel_id: The channel UUID to check.
+        db: Active async DB session.
+        new_video_id: The video ID we're about to process (for logging).
+    """
+    result = await db.execute(
+        select(YouTubeChannel).where(YouTubeChannel.id == channel_id)
+    )
+    ch = result.scalar_one_or_none()
+    if not ch:
+        return
+
+    if ch.transcript_retry_count and ch.transcript_retry_count > 0:
+        # Check how long it's been stuck
+        if ch.last_checked_at:
+            stuck_duration = (datetime.utcnow() - ch.last_checked_at).total_seconds()
+            max_expected = _TRANSCRIPT_RETRY_MAX * SCAN_INTERVAL_SECONDS * 2
+            if stuck_duration > max_expected:
+                logger.warning(
+                    "DEFENSIVE: Channel '%s' has stuck retry_count=%d (last_checked=%ds ago). "
+                    "Resetting counter — previous fix may have been incomplete.",
+                    ch.channel_name, ch.transcript_retry_count, int(stuck_duration)
+                )
+                await _update_channel(db, channel_id, transcript_retry_count=0)
+                await db.commit()
+
 
 async def _throttle_yt(min_delay: float | None = None) -> None:
     """Ensure at least `min_delay` seconds since the last YouTube request.
@@ -327,6 +368,11 @@ async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> N
     last_video_id = channel.last_video_id
     prompt_id = channel.prompt_id
     user_id = channel.user_id
+
+    # ── Defensive: detect and heal stuck retry state ──────────────────────
+    # This runs every cycle so a crashed scheduler can't leave the channel
+    # in an infinite retry loop permanently.
+    await _assert_channel_not_stuck(channel_id, db, last_video_id or "?")
 
     # Resolve channel ID if it's a handle
     real_channel_id = await resolve_channel_id(stored_channel_id)
