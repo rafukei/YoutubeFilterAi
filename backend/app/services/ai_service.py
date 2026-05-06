@@ -138,7 +138,7 @@ async def query_ai(
     redis_client: aioredis.Redis,
     model: str = "openai/gpt-4.1-mini",
     fallback_model: Optional[str] = None,
-) -> str:
+) -> tuple[str, str]:
     """Send a prompt + transcript to OpenRouter and return the AI response.
 
     This is the main entrypoint used by the processing pipeline. It performs
@@ -162,7 +162,9 @@ async def query_ai(
             on capacity/context errors.
 
     Returns:
-        The AI-generated response text (string) from the chosen model.
+        A ``(response_text, model_used)`` tuple where ``response_text`` is the
+        AI-generated response string and ``model_used`` is the OpenRouter model
+        id that actually generated it (primary or fallback).
 
     Raises:
         RuntimeError: If the user is rate-limited, or if OpenRouter returns an
@@ -170,6 +172,18 @@ async def query_ai(
             includes the model id and the upstream error body when available.
     """
     await _check_rate_limit(user_id, redis_client)
+
+    # Validate primary model before calling — fail fast if the model doesn't exist
+    try:
+        is_valid = await _validate_model(model, api_token)
+        if not is_valid:
+            logger.warning(
+                "Model %s not available on OpenRouter — falling back to openai/gpt-4.1-mini",
+                model
+            )
+            model = "openai/gpt-4.1-mini"
+    except Exception as e:
+        logger.debug("Model validation failed for %s: %s — proceeding anyway", model, e)
 
     # Debug: log incoming call parameters so we can trace which model is used
     try:
@@ -189,14 +203,55 @@ async def query_ai(
         "max_tokens", "capacity", "overloaded", "503", "model_not_available",
     )
 
-    async def _call_model(chosen_model: str) -> str:
+
+async def _validate_model(model_id: str, api_token: str) -> bool:
+    """Return True if model_id is available on OpenRouter.
+
+    Caches the result in module-level _model_cache to avoid repeated API calls.
+    The cache maps model_id → bool and has a 5-minute TTL.
+    """
+    import time
+    import asyncio
+
+    now = time.monotonic()
+    if not hasattr(_validate_model, "_cache"):
+        _validate_model._cache = {}  # type: dict[str, tuple[bool, float]]
+    cache = _validate_model._cache
+
+    if model_id in cache:
+        valid, timestamp = cache[model_id]
+        if now - timestamp < 300:  # 5-minute TTL
+            return valid
+
+    try:
+        headers = {"Authorization": f"Bearer {api_token}"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{settings.OPENROUTER_BASE_URL}/models",
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                available = {m["id"] for m in resp.json().get("data", [])}
+                valid = model_id in available
+            else:
+                valid = True  # Can't verify — assume valid to avoid blocking
+    except Exception:
+        valid = True  # Network error — assume valid
+
+    cache[model_id] = (valid, now)
+    return valid
+
+    async def _call_model(chosen_model: str) -> tuple[str, str]:
         """Make a single OpenRouter API call with the given model.
 
         Args:
             chosen_model: Model id to request from OpenRouter.
 
         Returns:
-            The response body string from the model (assistant content).
+            A ``(response_body, model_used)`` tuple where ``response_body`` is
+            the assistant content string and ``model_used`` is the model id that
+            actually handled the request (may differ from ``chosen_model`` if
+            it was swapped to the fallback due to context-length pre-flight).
 
         Raises:
             RuntimeError: If OpenRouter responds with a non-2xx status code
@@ -264,19 +319,34 @@ async def query_ai(
                     f"OpenRouter API error {response.status_code} (model: {chosen_model}): {err_msg}"
                 )
             data = response.json()
-            return data["choices"][0]["message"]["content"]
+            return data["choices"][0]["message"]["content"], chosen_model
 
     # Try primary model
     try:
-        return await _call_model(model)
+        response_text, model_used = await _call_model(model)
+        return response_text, model_used
     except Exception as primary_err:
         err_str = str(primary_err).lower()
+        # Validate fallback model if primary failed and fallback was provided
+        if fallback_model:
+            try:
+                fb_valid = await _validate_model(fallback_model, api_token)
+                if not fb_valid:
+                    logger.warning(
+                        "Fallback model %s not available on OpenRouter — skipping fallback",
+                        fallback_model
+                    )
+                    fallback_model = None
+            except Exception as e:
+                logger.debug("Fallback model validation failed for %s: %s", fallback_model, e)
+
         if fallback_model and any(kw in err_str for kw in _FALLBACK_KEYWORDS):
             # Primary failed on capacity/context — try fallback
             # Check rate limit again for the second call
             await _check_rate_limit(user_id, redis_client)
             try:
-                return await _call_model(fallback_model)
+                response_text, model_used = await _call_model(fallback_model)
+                return response_text, model_used
             except Exception as fallback_err:
                 raise RuntimeError(
                     f"Both models failed. Primary ({model}): {primary_err}; "
@@ -285,7 +355,7 @@ async def query_ai(
         raise
 
 
-def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None) -> dict:
+def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None, ai_model: str | None = None) -> dict:
     """Extract the JSON routing block from the end of an AI response.
 
     The prompt instructs the AI to append a JSON block like:
@@ -298,6 +368,9 @@ def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None) -> di
         ai_response: Full AI response text.
         prompt_routing: Optional dict parsed from the prompt's own routing JSON.
             Used as fallback for telegram_bots / web_views if AI omits them.
+        ai_model: Optional model identifier string (e.g. "openai/gpt-4o-mini").
+            When provided, the model's friendly name is appended to the message
+            as an attribution footer so the user knows which AI generated it.
 
     Returns:
         A dict with keys: ``message`` (string), ``telegram_bots`` (list),
@@ -325,17 +398,64 @@ def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None) -> di
                     parsed["telegram_bots"] = prompt_routing["telegram_bots"]
                 if not parsed.get("web_views") and prompt_routing.get("web_views"):
                     parsed["web_views"] = prompt_routing["web_views"]
+                # Append AI model attribution when provided
+                if ai_model:
+                    friendly = _friendly_model_name(ai_model)
+                    parsed["message"] = f"{parsed['message']}\n\n🤖 AI model: {friendly}"
                 return parsed
     except (json.JSONDecodeError, ValueError):
         pass
 
     # Fallback: treat entire response as the message
+    message = ai_response
+    if ai_model:
+        friendly = _friendly_model_name(ai_model)
+        message = f"{message}\n\n🤖 AI model: {friendly}"
     return {
-        "message": ai_response,
+        "message": message,
         "telegram_bots": [],
         "web_views": [],
         "visibility": True,
     }
+
+
+def _friendly_model_name(model_id: str) -> str:
+    """Convert a model id like 'openai/gpt-4o-mini' to a friendly name like 'GPT-4o Mini'.
+
+    Uses a curated map for known models; falls back to auto-formatting the id
+    by stripping the provider prefix and converting dash-separated words to
+    Title Case.
+    """
+    # Curated map for known models
+    known = {
+        "openai/gpt-3.5-turbo": "GPT-3.5 Turbo",
+        "openai/gpt-4o-mini": "GPT-4o Mini",
+        "openai/gpt-4o": "GPT-4o",
+        "openai/gpt-4.1-mini": "GPT-4.1 Mini",
+        "anthropic/claude-3-haiku": "Claude 3 Haiku",
+        "anthropic/claude-3.5-sonnet": "Claude 3.5 Sonnet",
+        "google/gemini-pro-1.5": "Gemini Pro 1.5",
+        "meta-llama/llama-3.1-70b-instruct": "Llama 3.1 70B",
+        "meta-llama/llama-3.1-8b-instruct": "Llama 3.1 8B",
+        "mistralai/mistral-7b-instruct": "Mistral 7B",
+        "qwen/qwen-2-72b-instruct": "Qwen 2 72B",
+        "gpt-oss-120b": "GPT-OSS 120B (Free)",
+    }
+    if model_id in known:
+        return known[model_id]
+
+    # Auto-generate friendly name from id: strip provider prefix and format
+    # e.g. "openrouter/gpt-oss-120b" -> "Gpt Oss 120b" -> "Gpt-Oss-120b"
+    # e.g. "provider/model-name-7b" -> "Model-Name-7b"
+    if "/" in model_id:
+        name = model_id.split("/", 1)[1]
+    else:
+        name = model_id
+
+    # Convert hyphen/underscore separated words to Title Case
+    # "gpt-oss-120b" -> "Gpt-Oss-120b"
+    formatted = "-".join(w.capitalize() for w in name.replace("_", "-").split("-"))
+    return formatted
 
 
 async def resolve_folder_prompts(

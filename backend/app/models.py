@@ -94,6 +94,7 @@ class YouTubeChannel(Base):
     
     # Processing settings
     prompt_id = Column(UUID(as_uuid=True), ForeignKey("prompts.id", ondelete="SET NULL"), nullable=True)  # Which prompt to use
+    transcript_retry_count = Column(Integer, default=0)  # Consecutive transcript fetch failures — reset on success
     
     added_at = Column(DateTime, default=datetime.utcnow)
 
