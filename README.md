@@ -2,7 +2,7 @@
 
 > AI-powered YouTube transcript filter and summariser with Telegram bot integration, web views, and admin panel.
 
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/rafukei/YoutubeFilterAi/releases)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/rafukei/YoutubeFilterAi/releases)
 [![Python](https://img.shields.io/badge/python-3.12-yellow.svg)](https://python.org)
 [![React](https://img.shields.io/badge/react-18-61DAFB.svg)](https://react.dev)
 
@@ -68,6 +68,8 @@
 - **📂 Prompt Templates** — Folder/tree structure, per-prompt AI model selection, fallback models
 - **✏️ Inline Rename** — Double-click to rename prompts and folders
 - **📺 Channel Monitoring** — Subscribe to YouTube channels with scheduled auto-checking
+- **🧭 FIFO Scheduler Queue** — Oldest reserved channel is processed first (one reservation per channel)
+- **⏱️ Transcript Cooldown & Telemetry** — Redis counters + cooldown windows to reduce repeated rate-limit failures
 - **📨 Telegram Integration** — Auto-send summaries to your Telegram bots
 - **🌐 Web Views** — Auto-created filtered views for categorised summaries
 - **📥 Data Export/Import** — Download & restore your prompts and channel subscriptions
@@ -168,6 +170,8 @@ Every prompt ends with a JSON routing block that tells the system where to send 
 ### Rate Limiting
 
 Free-tier OpenRouter: configurable via admin settings, tracked per-user in Redis.
+
+YouTube transcript fetches also use Redis-based rolling counters and cooldown keys to avoid repeating known rate-limited requests.
 
 ---
 
@@ -285,6 +289,13 @@ docker compose exec backend python -m pytest tests/ -v
 ---
 
 ## 🔄 Changelog
+
+### v1.3.0
+- 🧭 Scheduler queue policy is now FIFO (oldest reservation first) with per-channel reservation deduplication
+- ⏱️ Transcript rate-limit telemetry + cooldown windows added for auto-processing
+- 🔁 Improved scheduler IP-block handling (faster cooldown trigger, safer reset semantics)
+- 🛡️ Frontend crash hardening (global error boundary + safer API error rendering)
+- 🔐 Documentation helper script no longer stores credentials in source (env vars only)
 
 ### v1.2.0
 - 🐛 Web views auto-created from prompt routing (fix: messages were silently dropped)
