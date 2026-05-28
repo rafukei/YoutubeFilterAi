@@ -4,16 +4,16 @@ Uses a real user account for user-facing pages and admin credentials
 for admin pages. Email addresses are masked in all screenshots.
 """
 import asyncio
+import os
 from playwright.async_api import async_playwright
 
-BASE = "http://localhost"
-# Regular user credentials
-USER_EMAIL = "raafael.keikko@gmail.com"
-USER_PASS = "enmuista"
-# Admin credentials (from .env)
-ADMIN_USER = "raafael.keikko@gmail.com"
-ADMIN_PASS = "02Enmui1ta"
-OUT = "docs/screenshots"
+BASE = os.getenv("APP_BASE_URL", "http://localhost")
+# Credentials must come from environment variables (never hardcoded in repo)
+USER_EMAIL = os.getenv("SCREENSHOT_USER_EMAIL", "")
+USER_PASS = os.getenv("SCREENSHOT_USER_PASSWORD", "")
+ADMIN_USER = os.getenv("SCREENSHOT_ADMIN_USER", "")
+ADMIN_PASS = os.getenv("SCREENSHOT_ADMIN_PASSWORD", "")
+OUT = os.getenv("SCREENSHOT_OUT_DIR", "docs/screenshots")
 
 # JS snippet to mask any visible email addresses on the page
 MASK_EMAIL_JS = """
@@ -43,6 +43,18 @@ async def screenshot(page, path, full=False):
 
 
 async def main():
+    required = {
+        "SCREENSHOT_USER_EMAIL": USER_EMAIL,
+        "SCREENSHOT_USER_PASSWORD": USER_PASS,
+        "SCREENSHOT_ADMIN_USER": ADMIN_USER,
+        "SCREENSHOT_ADMIN_PASSWORD": ADMIN_PASS,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise RuntimeError(
+            "Missing required env vars: " + ", ".join(missing)
+        )
+
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         ctx = await browser.new_context(viewport={"width": 1280, "height": 800})

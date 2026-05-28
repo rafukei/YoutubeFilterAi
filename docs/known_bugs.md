@@ -93,16 +93,38 @@
 | Kuukausi | Bugikorjauksia | Huom |
 |----------|----------------|------|
 | 2026-04  | 3 (4de31f6)    | Suuri julkaisu - OOM, crash loop, duplicate |
-| 2026-05  | 2 (b113b55)    | Infinite retry, mallin validointi |
+| 2026-05  | 3 (b113b55, 2026-05-15) | Infinite retry, mallin validointi, BUG-008, BUG-009 |
 
 ---
 
 ## 🔴 Äskettäin Löydetyt Uudet Bugit (tutkimatta)
 
 ### BUG-008: `uq_user_channel` duplicate key constraint violation
-- **Löydetty:** 2026-05-06 (monitor.py) — *TUTKIMATTA, KORJAAMATTA*
+- **Löydetty:** 2026-05-06 (monitor.py)
+- **Korjattu:** 2026-05-15 (resource_routes.py rivi 186)
 - **Vakavuus:** Kriittinen — toistuu ~77s välein, täyttää lokit ERROR-viesteillä
-- **Oire:** `ERROR: duplicate key value violates unique constraint "uq_user_channel"` — toistuu 9 kertaa tunnissa per virhetapahtuma
-- **Sijainti:** Tietokanta kirjoittaa tätä; joko UI lisää duplikaattikanavan TAI scheduler yrittää päivittää channel_id:ta duplikaattiin
-- **Tutkiminen:** `resource_routes.py` — channel creation endpoint; `scheduler.py` — `resolve_channel_id` + `_update_channel`
-- **TODO:** Ei korjattu vielä — tämä bugi vaatii erillisen tutkimuksen
+- **Oire:** `ERROR: duplicate key value violates unique constraint "uq_user_channel"`
+- **Korjaus:** `add_channel`-endpoint tarkistaa ennen insert: `SELECT ... WHERE user_id=? AND channel_id=?` — jos löytyy, palauttaa HTTP 409 "Channel already exists"
+
+### BUG-009: Tarpeeton `import asyncio` sisäkkäisessä funktiossa
+- **Korjattu:** 2026-05-15 (ai_service.py rivi 214)
+- **Vakavuus:** Matala — ei estä toimintaa, turha import
+- **Oire:** `_validate_model` sisälsi `import asyncio`:n jota ei käytetä
+- **Korjaus:** Poistettu rivi 214
+
+### BUG-010: `parse_ai_routing` kaatui None/tyhjällä vastauksella
+- **Korjattu:** 2026-05-15 (ai_service.py:385)
+- **Vakavuus:** Kriittinen — yksi None-vastaus kaatoi koko videokäsittelyn
+- **Oire:** `ERROR:scheduler:Error processing channel @matthew_berman: 'NoneType' object has no attribute 'rfind'`
+- **Juurisyy:** `parse_ai_routing` ei tarkistanut None/tyhjää vastauksia ennen `rfind`-kutsua
+- **Korjaus:** Lisätty guard-clause funktion alkuun: `if not ai_response: return defaults`
+
+### BUG-011: HTTP 429 ei triggering IP block cooldown, aiheuttaa redundantteja retrytöitä
+- **Korjattu:** 2026-05-15 (`services/__init__.py`, `process_routes.py`, `scheduler.py`)
+- **Vakavuus:** Korkea — 429 aiheutti `RuntimeError` → ei triggeröinyt `IPBlockedError`-cooldownia → scheduler yritti uudelleen liian nopeasti
+- **Oire:** `"Could not fetch video transcript: yt-dlp failed for vMiqO9rDO9c: HTTP Error 429: Too Many Requests"`
+- **Juurisyy:** `_fetch_transcript_ytdlp` throw `RuntimeError` 429:lle → ei matching `IPBlockedError` in `process_channel` → cooldown ei käynnistynyt
+- **Korjaus:**
+  - Uusi `RetryableYtdlpError` exception (`services/__init__.py`)
+  - `process_routes.py`: handle `RetryableYtdlpError` → HTTP 503 "try again in a few minutes"
+  - `scheduler.py`: handle `RetryableYtdlpError` → raise `IPBlockedError` → trigger cooldown mechanism

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface Prompt { id: string; name: string; parent_id: string | null; is_folder: boolean }
 
@@ -27,15 +28,24 @@ export default function ChannelsPage() {
   const [editingChannel, setEditingChannel] = useState<string | null>(null)
 
   const load = async () => {
-    const [channelsRes, promptsRes] = await Promise.all([
-      api.get('/channels'),
-      api.get('/prompts')
-    ])
-    setChannels(channelsRes.data)
-    const all = promptsRes.data as Prompt[]
-    setAllPrompts(all)
-    // Include both prompts and folders — folders run all child prompts
-    setPrompts(all)
+    try {
+      const [channelsRes, promptsRes] = await Promise.all([
+        api.get('/channels'),
+        api.get('/prompts')
+      ])
+      const channelsData = Array.isArray(channelsRes.data) ? channelsRes.data : []
+      const promptsData = Array.isArray(promptsRes.data) ? promptsRes.data : []
+      setChannels(channelsData)
+      const all = promptsData as Prompt[]
+      setAllPrompts(all)
+      // Include both prompts and folders — folders run all child prompts
+      setPrompts(all)
+    } catch (err) {
+      console.error('Failed to load channels/prompts:', err)
+      setChannels([])
+      setAllPrompts([])
+      setPrompts([])
+    }
   }
   useEffect(() => { load() }, [])
 
@@ -54,7 +64,7 @@ export default function ChannelsPage() {
       setSelectedPrompt('')
       load()
     } catch (err: any) {
-      alert(err.response?.data?.detail || 'Failed to add channel')
+      alert(getErrorMessage(err, 'Failed to add channel'))
     }
   }
 

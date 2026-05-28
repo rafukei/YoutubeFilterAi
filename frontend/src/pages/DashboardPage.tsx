@@ -34,12 +34,18 @@ export default function DashboardPage() {
         api.get('/web-views'),
       ])
       setProfile(profileRes.data)
+
+      const prompts = Array.isArray(promptsRes.data) ? promptsRes.data : []
+      const bots = Array.isArray(botsRes.data) ? botsRes.data : []
+      const channels = Array.isArray(channelsRes.data) ? channelsRes.data : []
+      const webViews = Array.isArray(viewsRes.data) ? viewsRes.data : []
+
       setStatus({
-        hasApiKey: !!profileRes.data.openrouter_api_token,
-        hasPrompts: promptsRes.data.filter((p: any) => !p.is_folder).length > 0,
-        hasBots: botsRes.data.length > 0,
-        hasChannels: channelsRes.data.length > 0,
-        hasWebViews: viewsRes.data.length > 0,
+        hasApiKey: !!profileRes.data?.openrouter_api_token,
+        hasPrompts: prompts.filter((p: any) => !p.is_folder).length > 0,
+        hasBots: bots.length > 0,
+        hasChannels: channels.length > 0,
+        hasWebViews: webViews.length > 0,
       })
     } catch (err) {
       console.error('Failed to load dashboard data:', err)

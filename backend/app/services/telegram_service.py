@@ -11,7 +11,17 @@ Functions:
     send_telegram_message(bot_token: str, chat_id: str, text: str, video_url: str) -> bool
 """
 
+import re
 import httpx
+
+
+def _strip_html(text: str) -> str:
+    """Remove HTML tags so text is safe for Telegram plain-text delivery."""
+    # Strip paired tags and their contents
+    text = re.sub(r'<[^>]+>', '', text)
+    # Decode common HTML entities
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
+    return text.strip()
 
 
 async def validate_bot_token(bot_token: str) -> dict:
@@ -82,15 +92,17 @@ async def send_telegram_message(
         True if the message was sent successfully.
     """
     full_text = f"{text}\n\n🔗 Source: {video_url}"
+    # Strip any HTML the AI left in — avoids 400 Bad Request from malformed tags
+    safe_text = _strip_html(full_text)
 
     # Telegram message limit is 4096 chars; split if needed
-    chunks = [full_text[i : i + 4096] for i in range(0, len(full_text), 4096)]
+    chunks = [safe_text[i : i + 4096] for i in range(0, len(safe_text), 4096)]
 
     async with httpx.AsyncClient(timeout=30) as client:
         for chunk in chunks:
             resp = await client.post(
                 f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"},
+                json={"chat_id": chat_id, "text": chunk},
             )
             if resp.status_code != 200:
                 return False

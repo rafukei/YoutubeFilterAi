@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useState, useEffect } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface AppSettings {
   registration_enabled: boolean
@@ -66,7 +67,7 @@ export default function AdminSettingsPage() {
       
       setStats(statsRes.data as AdminStats)
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load settings')
+      setError(getErrorMessage(err, 'Failed to load settings'))
     } finally {
       setLoading(false)
     }
@@ -103,7 +104,7 @@ export default function AdminSettingsPage() {
       setGoogleClientId('')
       setGoogleClientSecret('')
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to save settings')
+      setError(getErrorMessage(err, 'Failed to save settings'))
     } finally {
       setSaving(false)
     }
@@ -288,7 +289,7 @@ export default function AdminSettingsPage() {
                       setSuccess(`Cleanup complete: ${res.data.deleted_messages} messages removed`)
                       loadData()
                     } catch (err: any) {
-                      setError(err.response?.data?.detail || 'Cleanup failed')
+                      setError(getErrorMessage(err, 'Cleanup failed'))
                     }
                   }}
                   className="px-4 py-2 bg-yellow-600 text-white font-semibold rounded-lg hover:bg-yellow-500 transition"
@@ -310,7 +311,7 @@ export default function AdminSettingsPage() {
                       URL.revokeObjectURL(url)
                       setSuccess('Backup downloaded successfully!')
                     } catch (err: any) {
-                      setError(err.response?.data?.detail || 'Backup failed')
+                      setError(getErrorMessage(err, 'Backup failed'))
                     }
                   }}
                   className="px-4 py-2 bg-green-600 text-white font-semibold rounded-lg hover:bg-green-500 transition"

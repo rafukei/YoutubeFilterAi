@@ -14,11 +14,33 @@ import logging
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 from youtube_transcript_api import YouTubeTranscriptApi
 
 logger = logging.getLogger(__name__)
+
+
+class RetryableYtdlpError(Exception):
+    """yt-dlp failed due to a temporary condition (rate-limit, network) — should retry."""
+    pass
+
+
+def _is_youtube_rate_limit_error(text: str) -> bool:
+    """Detect YouTube/yt-dlp rate-limit style errors robustly."""
+    normalized = (text or "").lower()
+    signals = (
+        "http error 429",
+        "too many requests",
+        "rate limit",
+        "rate-limited",
+        "quota exceeded",
+        "too many requests in 1",
+        "unable to download video subtitles",
+        "rate limit hit",
+    )
+    return any(s in normalized for s in signals)
 
 
 def extract_video_id(url: str) -> str:
@@ -105,7 +127,19 @@ def fetch_transcript(video_id: str, languages: Optional[list[str]] = None) -> st
     
     # Method 3: yt-dlp fallback (better at bypassing IP bans)
     logger.info("Trying yt-dlp fallback for transcript %s", video_id)
-    return _fetch_transcript_ytdlp(video_id, languages)
+    try:
+        return _fetch_transcript_ytdlp(video_id, languages)
+    except RetryableYtdlpError:
+        # Retry with backoff for rate-limit spikes: 5s → 15s → 45s
+        for attempt in range(1, 4):
+            wait = 5 * (3 ** (attempt - 1))
+            logger.warning("yt-dlp rate-limit for %s, retry %d/3 in %ds", video_id, attempt, wait)
+            time.sleep(wait)
+            try:
+                return _fetch_transcript_ytdlp(video_id, languages)
+            except RetryableYtdlpError:
+                continue
+        raise RetryableYtdlpError(f"yt-dlp exhausted all retries for {video_id}")
 
 
 def _fetch_transcript_ytdlp(video_id: str, languages: list[str]) -> str:
@@ -154,15 +188,17 @@ def _fetch_transcript_ytdlp(video_id: str, languages: list[str]) -> str:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"yt-dlp timed out fetching subtitles for {video_id}")
         
-        # Check stderr for real errors (429, IP block, etc.) even on success
+        # Check stderr/stdout for real errors (429, IP block, etc.) even on success
         stderr = result.stderr or ""
-        if "429" in stderr or "Too Many Requests" in stderr:
-            raise RuntimeError(f"yt-dlp failed for {video_id}: HTTP Error 429: Too Many Requests")
-        
+        stdout = result.stdout or ""
+        combined_output = f"{stderr}\n{stdout}"
         # Find subtitle files (vtt or json3)
         sub_files = list(Path(tmpdir).glob("subs*.*"))
         sub_files = [f for f in sub_files if f.suffix in (".vtt", ".json3") and f.stat().st_size > 0]
-        
+
+        if _is_youtube_rate_limit_error(combined_output):
+            raise RetryableYtdlpError(f"yt-dlp rate-limited for {video_id}: {stderr[:120] or stdout[:120]}")
+
         if not sub_files:
             error_detail = stderr[:200] if stderr else "no subtitles found"
             raise RuntimeError(f"yt-dlp found no subtitles for {video_id}: {error_detail}")

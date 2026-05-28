@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface UserProfile {
   id: string
@@ -31,7 +32,7 @@ export default function SettingsPage() {
       setProfile(res.data)
       // Don't populate token field for security - user must enter new one
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load profile')
+      setError(getErrorMessage(err, 'Failed to load profile'))
     } finally {
       setLoading(false)
     }
@@ -56,7 +57,7 @@ export default function SettingsPage() {
       setOpenrouterToken('')  // Clear for security
       loadProfile()  // Refresh
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to save token')
+      setError(getErrorMessage(err, 'Failed to save token'))
     } finally {
       setSaving(false)
     }
@@ -75,7 +76,7 @@ export default function SettingsPage() {
       setSuccess('OpenRouter API token removed')
       loadProfile()
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to remove token')
+      setError(getErrorMessage(err, 'Failed to remove token'))
     } finally {
       setSaving(false)
     }
@@ -204,7 +205,7 @@ export default function SettingsPage() {
                 URL.revokeObjectURL(url)
                 setSuccess('Data exported successfully!')
               } catch (err: any) {
-                setError(err.response?.data?.detail || 'Export failed')
+                setError(getErrorMessage(err, 'Export failed'))
               }
             }}
             className="px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-500 transition"
@@ -247,7 +248,7 @@ export default function SettingsPage() {
                     `Skipped ${r.prompts_skipped} duplicate prompts, ${r.channels_skipped} duplicate channels.`
                   )
                 } catch (err: any) {
-                  setError(err.response?.data?.detail || err.message || 'Import failed')
+                  setError(getErrorMessage(err, 'Import failed'))
                 }
                 e.target.value = ''
               }}

@@ -13,12 +13,25 @@ export default function SummaryPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [showHidden, setShowHidden] = useState(false)
 
-  useEffect(() => { api.get('/web-views').then(r => setViews(r.data)) }, [])
+  useEffect(() => {
+    api.get('/web-views')
+      .then(r => setViews(Array.isArray(r.data) ? r.data : []))
+      .catch(err => {
+        console.error('Failed to load web views:', err)
+        setViews([])
+      })
+  }, [])
+
   useEffect(() => {
     const params: Record<string, string> = {}
     if (activeView) params.web_view_id = activeView
     if (showHidden) params.show_hidden = 'true'
-    api.get('/messages', { params }).then(r => setMessages(r.data))
+    api.get('/messages', { params })
+      .then(r => setMessages(Array.isArray(r.data) ? r.data : []))
+      .catch(err => {
+        console.error('Failed to load messages:', err)
+        setMessages([])
+      })
   }, [activeView, showHidden])
 
   const toggleVis = async (id: string) => {

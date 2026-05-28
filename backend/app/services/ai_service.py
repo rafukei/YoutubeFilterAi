@@ -138,7 +138,8 @@ async def query_ai(
     redis_client: aioredis.Redis,
     model: str = "openai/gpt-4.1-mini",
     fallback_model: Optional[str] = None,
-) -> tuple[str, str]:
+    return_model: bool = False,
+) -> str | tuple[str, str]:
     """Send a prompt + transcript to OpenRouter and return the AI response.
 
     This is the main entrypoint used by the processing pipeline. It performs
@@ -203,73 +204,16 @@ async def query_ai(
         "max_tokens", "capacity", "overloaded", "503", "model_not_available",
     )
 
-
-async def _validate_model(model_id: str, api_token: str) -> bool:
-    """Return True if model_id is available on OpenRouter.
-
-    Caches the result in module-level _model_cache to avoid repeated API calls.
-    The cache maps model_id → bool and has a 5-minute TTL.
-    """
-    import time
-    import asyncio
-
-    now = time.monotonic()
-    if not hasattr(_validate_model, "_cache"):
-        _validate_model._cache = {}  # type: dict[str, tuple[bool, float]]
-    cache = _validate_model._cache
-
-    if model_id in cache:
-        valid, timestamp = cache[model_id]
-        if now - timestamp < 300:  # 5-minute TTL
-            return valid
-
-    try:
-        headers = {"Authorization": f"Bearer {api_token}"}
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(
-                f"{settings.OPENROUTER_BASE_URL}/models",
-                headers=headers,
-            )
-            if resp.status_code == 200:
-                available = {m["id"] for m in resp.json().get("data", [])}
-                valid = model_id in available
-            else:
-                valid = True  # Can't verify — assume valid to avoid blocking
-    except Exception:
-        valid = True  # Network error — assume valid
-
-    cache[model_id] = (valid, now)
-    return valid
-
     async def _call_model(chosen_model: str) -> tuple[str, str]:
-        """Make a single OpenRouter API call with the given model.
-
-        Args:
-            chosen_model: Model id to request from OpenRouter.
-
-        Returns:
-            A ``(response_body, model_used)`` tuple where ``response_body`` is
-            the assistant content string and ``model_used`` is the model id that
-            actually handled the request (may differ from ``chosen_model`` if
-            it was swapped to the fallback due to context-length pre-flight).
-
-        Raises:
-            RuntimeError: If OpenRouter responds with a non-2xx status code
-                or if the response JSON cannot be parsed into the expected
-                structure.
-        """
-        # Log the outgoing model and approximate token estimate for debugging
+        """Make a single OpenRouter API call with the given model."""
         try:
             approx_tokens = int(len(full_prompt) / 4)
         except Exception:
             approx_tokens = 0
-        # Try to find a known context length for the chosen model so we can
-        # pre-flight reject or switch to a fallback before sending to OpenRouter.
+
         model_info = next((m for m in DEFAULT_MODELS if m.get("id") == chosen_model), None)
         if model_info and model_info.get("context_length"):
             if approx_tokens > int(model_info["context_length"]):
-                # If a fallback model is provided and it can handle the input,
-                # use it instead of calling the undersized model.
                 fb_info = next((m for m in DEFAULT_MODELS if m.get("id") == fallback_model), None) if fallback_model else None
                 if fb_info and approx_tokens <= int(fb_info.get("context_length", 0)):
                     logger.warning(
@@ -278,9 +222,6 @@ async def _validate_model(model_id: str, api_token: str) -> bool:
                     )
                     chosen_model = fallback_model
                 else:
-                    # No adequate fallback: raise a clear error so the API can
-                    # return a 400 with an actionable message instead of a
-                    # 502 from an upstream 400.
                     raise RuntimeError(
                         f"Estimated prompt size ({approx_tokens} tokens) exceeds the context length for model {chosen_model} ({model_info['context_length']} tokens). "
                         "Choose a model with a larger context window (e.g. openai/gpt-4o-mini) or shorten the transcript."
@@ -299,35 +240,40 @@ async def _validate_model(model_id: str, api_token: str) -> bool:
                     "model": chosen_model,
                     "messages": [
                         {"role": "system", "content": (
-                        "You process YouTube video transcripts according to user instructions. "
-                        "IMPORTANT: The JSON routing block at the end of the user's prompt defines where to send results. "
-                        "You MUST always preserve the telegram_bots and web_views arrays exactly as given. "
-                        "The 'visibility' field controls ALL delivery: when false, the message is stored but NOT sent to Telegram or shown on web."
-                    )},
+                            "You process YouTube video transcripts according to user instructions. "
+                            "IMPORTANT: The JSON routing block at the end of the user's prompt defines where to send results. "
+                            "You MUST always preserve the telegram_bots and web_views arrays exactly as given. "
+                            "The 'visibility' field controls ALL delivery: when false, the message is stored but NOT sent to Telegram or shown on web."
+                        )},
                         {"role": "user", "content": full_prompt},
                     ],
                 },
             )
-            if response.status_code >= 400:
-                # Read the error body for a meaningful message
+            status_code = getattr(response, "status_code", None)
+            if isinstance(status_code, int) and status_code >= 400:
                 try:
                     err_body = response.json()
                     err_msg = err_body.get("error", {}).get("message", "") or str(err_body)
                 except Exception:
-                    err_msg = response.text[:500]
+                    err_msg = getattr(response, "text", "")[:500]
                 raise RuntimeError(
-                    f"OpenRouter API error {response.status_code} (model: {chosen_model}): {err_msg}"
+                    f"OpenRouter API error {status_code} (model: {chosen_model}): {err_msg}"
                 )
+
+            if hasattr(response, "raise_for_status"):
+                try:
+                    response.raise_for_status()
+                except Exception as e:
+                    raise RuntimeError(str(e))
+
             data = response.json()
             return data["choices"][0]["message"]["content"], chosen_model
 
-    # Try primary model
     try:
         response_text, model_used = await _call_model(model)
-        return response_text, model_used
+        return (response_text, model_used) if return_model else response_text
     except Exception as primary_err:
         err_str = str(primary_err).lower()
-        # Validate fallback model if primary failed and fallback was provided
         if fallback_model:
             try:
                 fb_valid = await _validate_model(fallback_model, api_token)
@@ -341,18 +287,53 @@ async def _validate_model(model_id: str, api_token: str) -> bool:
                 logger.debug("Fallback model validation failed for %s: %s", fallback_model, e)
 
         if fallback_model and any(kw in err_str for kw in _FALLBACK_KEYWORDS):
-            # Primary failed on capacity/context — try fallback
-            # Check rate limit again for the second call
             await _check_rate_limit(user_id, redis_client)
             try:
                 response_text, model_used = await _call_model(fallback_model)
-                return response_text, model_used
+                return (response_text, model_used) if return_model else response_text
             except Exception as fallback_err:
                 raise RuntimeError(
                     f"Both models failed. Primary ({model}): {primary_err}; "
                     f"Fallback ({fallback_model}): {fallback_err}"
                 )
         raise
+
+
+async def _validate_model(model_id: str, api_token: str) -> bool:
+    """Return True if model_id is available on OpenRouter.
+
+    Caches the result in module-level _model_cache to avoid repeated API calls.
+    The cache maps model_id → bool and has a 5-minute TTL.
+    """
+    import time
+
+    now = time.monotonic()
+    if not hasattr(_validate_model, "_cache"):
+        _validate_model._cache = {}  # type: dict[str, tuple[bool, float]]
+    cache = _validate_model._cache
+
+    if model_id in cache:
+        valid, timestamp = cache[model_id]
+        if now - timestamp < 300:
+            return valid
+
+    try:
+        headers = {"Authorization": f"Bearer {api_token}"}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{settings.OPENROUTER_BASE_URL}/models",
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                available = {m["id"] for m in resp.json().get("data", [])}
+                valid = model_id in available
+            else:
+                valid = True
+    except Exception:
+        valid = True
+
+    cache[model_id] = (valid, now)
+    return valid
 
 
 def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None, ai_model: str | None = None) -> dict:
@@ -384,6 +365,15 @@ def parse_ai_routing(ai_response: str, prompt_routing: dict | None = None, ai_mo
         dict is returned.
     """
     prompt_routing = prompt_routing or {}
+
+    # None or empty response — return defaults
+    if not ai_response:
+        return {
+            "message": "",
+            "telegram_bots": [],
+            "web_views": [],
+            "visibility": True,
+        }
 
     # Try to find the last JSON object in the response
     try:
@@ -444,18 +434,8 @@ def _friendly_model_name(model_id: str) -> str:
     if model_id in known:
         return known[model_id]
 
-    # Auto-generate friendly name from id: strip provider prefix and format
-    # e.g. "openrouter/gpt-oss-120b" -> "Gpt Oss 120b" -> "Gpt-Oss-120b"
-    # e.g. "provider/model-name-7b" -> "Model-Name-7b"
-    if "/" in model_id:
-        name = model_id.split("/", 1)[1]
-    else:
-        name = model_id
-
-    # Convert hyphen/underscore separated words to Title Case
-    # "gpt-oss-120b" -> "Gpt-Oss-120b"
-    formatted = "-".join(w.capitalize() for w in name.replace("_", "-").split("-"))
-    return formatted
+    # Unknown model: keep original id unchanged for traceability.
+    return model_id
 
 
 async def resolve_folder_prompts(

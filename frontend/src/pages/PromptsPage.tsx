@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface Prompt {
   id: string
@@ -74,12 +75,18 @@ export default function PromptsPage() {
   const [renameValue, setRenameValue] = useState('')
 
   const load = async () => {
-    const [promptsRes, modelsRes] = await Promise.all([
-      api.get('/prompts'),
-      api.get('/ai-models')
-    ])
-    setPrompts(promptsRes.data)
-    setModels(modelsRes.data)
+    try {
+      const [promptsRes, modelsRes] = await Promise.all([
+        api.get('/prompts'),
+        api.get('/ai-models')
+      ])
+      setPrompts(Array.isArray(promptsRes.data) ? promptsRes.data : [])
+      setModels(Array.isArray(modelsRes.data) ? modelsRes.data : [])
+    } catch (err) {
+      console.error('Failed to load prompts/models:', err)
+      setPrompts([])
+      setModels([])
+    }
   }
   useEffect(() => { load() }, [])
 
@@ -207,7 +214,7 @@ export default function PromptsPage() {
         response: data.message?.ai_response || data.ai_response || JSON.stringify(data, null, 2)
       })
     } catch (err: any) {
-      setTestResult({ error: err.response?.data?.detail || 'Test failed' })
+      setTestResult({ error: getErrorMessage(err, 'Test failed') })
     } finally { setTesting(false) }
   }
 

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface User { id: string; email: string; is_active: boolean; is_approved: boolean; created_at: string }
 
@@ -10,7 +11,15 @@ export default function AdminUsersPage() {
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
 
-  const load = () => api.get('/admin/users').then(r => setUsers(r.data))
+  const load = async () => {
+    try {
+      const r = await api.get('/admin/users')
+      setUsers(Array.isArray(r.data) ? r.data : [])
+    } catch (err) {
+      console.error('Failed to load admin users:', err)
+      setUsers([])
+    }
+  }
   useEffect(() => { load() }, [])
 
   const toggle = async (id: string, field: 'is_approved' | 'is_active', value: boolean) => {
@@ -28,7 +37,7 @@ export default function AdminUsersPage() {
       setNewEmail(''); setNewPassword('')
       load()
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create user')
+      setError(getErrorMessage(err, 'Failed to create user'))
     }
   }
 

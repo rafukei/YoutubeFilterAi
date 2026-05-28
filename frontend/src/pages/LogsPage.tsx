@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react'
+import { useState, useEffect } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 const LEVEL_COLORS: Record<string, string> = {
   ERROR: 'bg-red-700 text-red-100',
@@ -34,7 +35,7 @@ export default function LogsPage() {
       const { data } = await api.get('/logs', { params })
       setLogs(data)
     } catch (e: any) {
-      setError(e.response?.data?.detail || 'Failed to load logs')
+      setError(getErrorMessage(e, 'Failed to load logs'))
     }
     setLoading(false)
   }

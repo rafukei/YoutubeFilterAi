@@ -26,6 +26,7 @@ from app.services import extract_video_id, fetch_transcript
 from app.services.ai_service import query_ai, parse_ai_routing, resolve_folder_prompts
 from app.services.log_service import log_activity
 from app.services.telegram_service import send_telegram_message
+from app.services import RetryableYtdlpError
 
 logger = logging.getLogger("scheduler")
 logging.basicConfig(level=logging.INFO)
@@ -44,7 +45,7 @@ _YT_MIN_DELAY: float = 2.0  # seconds between any two YouTube requests
 
 # ── IP block handling ──────────────────────────────────────────────
 # Consecutive IP blocks trigger progressively longer cooldowns.
-_IP_BLOCK_THRESHOLD = 3          # pause after this many consecutive blocks
+_IP_BLOCK_THRESHOLD = 1          # pause after this many consecutive blocks
 _IP_BLOCK_BASE_MINUTES = 15      # initial cooldown: 15 min
 _IP_BLOCK_MAX_MINUTES = 60       # max cooldown: 60 min
 _ip_block_count: int = 0
@@ -54,6 +55,15 @@ _ip_block_cooldown_until: datetime | None = None
 # before giving up and marking it as the channel's last_video_id so it doesn't
 # block the entire channel indefinitely.
 _TRANSCRIPT_RETRY_MAX = 3
+
+# Auto-channel transcript rate-limit tracking/cooldown (Redis)
+_TRANSCRIPT_AUTO_COOLDOWN_SECONDS = 15 * 60
+_TRANSCRIPT_AUTO_RL_THRESHOLD_10M = 3
+
+# Scheduler reservation queue (FIFO): oldest reservation is processed first.
+# Each channel can reserve at most one slot at a time.
+_pending_channel_queue: list[dict] = []
+_pending_channel_ids: set[str] = set()
 
 # ── Defensive assertions ─────────────────────────────────────────────────────
 # These are self-healing checks that run at the START of process_channel()
@@ -332,6 +342,47 @@ class IPBlockedError(Exception):
     pass
 
 
+async def _auto_stats(redis_client, user_id: str) -> dict[str, int]:
+    req_1m = int(await redis_client.get(f"yt:auto:req:{user_id}:1m") or 0)
+    req_1h = int(await redis_client.get(f"yt:auto:req:{user_id}:1h") or 0)
+    req_3h = int(await redis_client.get(f"yt:auto:req:{user_id}:3h") or 0)
+    rl_10m = int(await redis_client.get(f"yt:auto:rl:{user_id}:10m") or 0)
+    rl_1h = int(await redis_client.get(f"yt:auto:rl:{user_id}:1h") or 0)
+    rl_3h = int(await redis_client.get(f"yt:auto:rl:{user_id}:3h") or 0)
+    return {
+        "req_1m": req_1m,
+        "req_1h": req_1h,
+        "req_3h": req_3h,
+        "rl_10m": rl_10m,
+        "rl_1h": rl_1h,
+        "rl_3h": rl_3h,
+    }
+
+
+async def _auto_track_attempt(redis_client, user_id: str) -> dict[str, int]:
+    p = redis_client.pipeline()
+    p.incr(f"yt:auto:req:{user_id}:1m")
+    p.expire(f"yt:auto:req:{user_id}:1m", 60)
+    p.incr(f"yt:auto:req:{user_id}:1h")
+    p.expire(f"yt:auto:req:{user_id}:1h", 3600)
+    p.incr(f"yt:auto:req:{user_id}:3h")
+    p.expire(f"yt:auto:req:{user_id}:3h", 10800)
+    await p.execute()
+    return await _auto_stats(redis_client, user_id)
+
+
+async def _auto_track_rate_limit(redis_client, user_id: str) -> dict[str, int]:
+    p = redis_client.pipeline()
+    p.incr(f"yt:auto:rl:{user_id}:10m")
+    p.expire(f"yt:auto:rl:{user_id}:10m", 600)
+    p.incr(f"yt:auto:rl:{user_id}:1h")
+    p.expire(f"yt:auto:rl:{user_id}:1h", 3600)
+    p.incr(f"yt:auto:rl:{user_id}:3h")
+    p.expire(f"yt:auto:rl:{user_id}:3h", 10800)
+    await p.execute()
+    return await _auto_stats(redis_client, user_id)
+
+
 async def _update_channel(db: AsyncSession, ch_id: UUID, **kwargs) -> None:
     """Update YouTubeChannel fields using an explicit UPDATE statement.
 
@@ -343,7 +394,7 @@ async def _update_channel(db: AsyncSession, ch_id: UUID, **kwargs) -> None:
     await db.execute(stmt)
 
 
-async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> None:
+async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> bool | None:
     """Check a single channel for new videos and process if found.
 
     Raises:
@@ -391,9 +442,19 @@ async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> N
             await _update_channel(db, channel_id, channel_id=real_channel_id)
             await db.commit()
         except IntegrityError:
-            # Another row already has this channel_id for this user — the handle
-            # was already resolved by a concurrent run. Silently skip.
+            # Another row already has this channel_id for this user (duplicate channel).
+            # Roll back failed UPDATE, mark this channel checked so FIFO won't get stuck
+            # retrying the same duplicate reservation every cycle.
             await db.rollback()
+            await log_activity(
+                db,
+                user_id,
+                "WARNING",
+                "scheduler",
+                f"Duplicate channel mapping for {channel_name} -> {real_channel_id}; skipping this row"
+            )
+            await _update_channel(db, channel_id, last_checked_at=datetime.utcnow())
+            await db.commit()
             return
 
     handle_for_fallback = original_handle or channel_name
@@ -451,8 +512,47 @@ async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> N
     await _update_channel(db, channel_id, last_video_id=new_video_id, last_checked_at=datetime.utcnow())
     await db.commit()
 
+    # Track auto-fetch volume and block repeated same-video retries during cooldown.
+    stats = await _auto_track_attempt(redis_client, str(user_id))
+    cooldown_key = f"yt:auto:cooldown:{user_id}:{new_video_id}"
+    cooldown_ttl = await redis_client.ttl(cooldown_key)
+    cooldown_ttl = cooldown_ttl if isinstance(cooldown_ttl, int) and cooldown_ttl > 0 else 0
+    if cooldown_ttl > 0:
+        await log_activity(
+            db,
+            user_id,
+            "WARNING",
+            "scheduler",
+            (
+                f"Auto transcript cooldown active for {new_video_id}: {cooldown_ttl}s left; "
+                f"req_1m={stats['req_1m']} req_1h={stats['req_1h']} req_3h={stats['req_3h']} "
+                f"rl_10m={stats['rl_10m']} rl_1h={stats['rl_1h']} rl_3h={stats['rl_3h']}"
+            )
+        )
+        return
+
     try:
         transcript = fetch_transcript(new_video_id)
+    except RetryableYtdlpError as e:
+        stats = await _auto_track_rate_limit(redis_client, str(user_id))
+        cooldown_set = 0
+        if stats["rl_10m"] >= _TRANSCRIPT_AUTO_RL_THRESHOLD_10M:
+            cooldown_set = _TRANSCRIPT_AUTO_COOLDOWN_SECONDS
+            await redis_client.set(cooldown_key, "1", ex=cooldown_set)
+
+        await log_activity(
+            db,
+            user_id,
+            "WARNING",
+            "scheduler",
+            (
+                f"Auto transcript rate-limited for {new_video_id}: {e}; "
+                f"req_1m={stats['req_1m']} req_1h={stats['req_1h']} req_3h={stats['req_3h']} "
+                f"rl_10m={stats['rl_10m']} rl_1h={stats['rl_1h']} rl_3h={stats['rl_3h']} "
+                f"cooldown_s={cooldown_set}"
+            )
+        )
+        raise IPBlockedError(f"Rate limited fetching transcript for {new_video_id}: {e}")
     except Exception as e:
         error_msg = str(e).lower()
         if any(kw in error_msg for kw in ("blocking", "ip", "blocked", "429", "too many", "rate")):
@@ -525,9 +625,18 @@ async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> N
                     )
                     break  # success
                 except Exception as e:
-                    if "503" in str(e) and attempt < max_retries:
-                        logger.warning("AI 503 for video %s prompt %s (attempt %d/%d), retrying in %ds…",
-                                       new_video_id, prompt.name, attempt, max_retries, retry_delay)
+                    err = str(e).lower()
+                    is_retryable_ai = (
+                        "503" in err
+                        or "rate limit exceeded" in err
+                        or "too many requests" in err
+                        or "retry later" in err
+                    )
+                    if is_retryable_ai and attempt < max_retries:
+                        logger.warning(
+                            "AI temporary limit/error for video %s prompt %s (attempt %d/%d), retrying in %ds…",
+                            new_video_id, prompt.name, attempt, max_retries, retry_delay,
+                        )
                         await asyncio.sleep(retry_delay)
                     else:
                         raise
@@ -621,6 +730,7 @@ async def process_channel(channel_id: UUID, db: AsyncSession, redis_client) -> N
     await db.commit()
 
     logger.info("Processed video %s for channel %s", new_video_id, channel_name)
+    return True
 
 
 async def scheduler_loop(redis_client) -> None:
@@ -673,6 +783,7 @@ async def scheduler_loop(redis_client) -> None:
                 channel_data = [
                     {
                         "id": ch.id,
+                        "user_id": ch.user_id,
                         "name": ch.channel_name,
                         "last_checked_at": ch.last_checked_at,
                         "check_interval_minutes": ch.check_interval_minutes,
@@ -680,36 +791,49 @@ async def scheduler_loop(redis_client) -> None:
                     for ch in channels
                 ]
 
+                # 1) Reserve due channels into FIFO queue (one reservation per channel)
                 for cd in channel_data:
-                    # Check if enough time has passed since last check
                     if cd["last_checked_at"]:
                         next_check = cd["last_checked_at"] + timedelta(minutes=cd["check_interval_minutes"])
                         if now < next_check:
                             continue
 
-                    # Delay BEFORE processing each channel to spread requests
+                    ch_key = str(cd["id"])
+                    if ch_key in _pending_channel_ids:
+                        continue
+
+                    _pending_channel_queue.append(cd)
+                    _pending_channel_ids.add(ch_key)
+
+                # 2) Process exactly one reserved channel per scheduler cycle (FIFO)
+                if _pending_channel_queue:
+                    cd = _pending_channel_queue.pop(0)
+                    _pending_channel_ids.discard(str(cd["id"]))
+
                     if request_delay > 0:
-                        logger.debug("Waiting %ds before channel %s…", request_delay, cd["name"])
+                        logger.debug("Waiting %ds before reserved channel %s…", request_delay, cd["name"])
                         await asyncio.sleep(request_delay)
 
                     try:
-                        await process_channel(cd["id"], db, redis_client)
-                        # Successful request — reset consecutive block counter
-                        if _ip_block_count > 0:
-                            logger.info("✓ YouTube request succeeded after %d block(s) — resetting block counter", _ip_block_count)
+                        processed_ok = await process_channel(cd["id"], db, redis_client)
+                        if processed_ok is True and _ip_block_count > 0:
+                            logger.info("✓ Transcript pipeline succeeded after %d block(s) — resetting block counter", _ip_block_count)
                             _ip_block_count = 0
                             _ip_block_cooldown_until = None
                     except IPBlockedError as ipb:
-                        # IP ban on THIS channel — skip it and move to the next.
-                        # Do NOT abort the whole cycle; other channels may have
-                        # unprocessed videos.
                         _ip_block_count += 1
                         logger.warning(
                             "⚠ IP blocked for channel %s (%s) — consecutive block #%d",
                             cd["name"], ipb, _ip_block_count
                         )
+                        await log_activity(
+                            db,
+                            cd["user_id"],
+                            "WARNING",
+                            "transcript",
+                            f"IP blocked for {cd['name']}: {ipb} (consecutive={_ip_block_count})"
+                        )
                         if _ip_block_count >= _IP_BLOCK_THRESHOLD:
-                            # Calculate cooldown: 15 → 30 → 60 min
                             cooldown_minutes = min(
                                 _IP_BLOCK_BASE_MINUTES * (2 ** (_ip_block_count - _IP_BLOCK_THRESHOLD)),
                                 _IP_BLOCK_MAX_MINUTES
@@ -719,7 +843,13 @@ async def scheduler_loop(redis_client) -> None:
                                 "🔒 IP block threshold (%d) reached — pausing scheduler for %d minutes",
                                 _IP_BLOCK_THRESHOLD, cooldown_minutes
                             )
-                        continue
+                            await log_activity(
+                                db,
+                                cd["user_id"],
+                                "ERROR",
+                                "scheduler",
+                                f"Global IP cooldown {cooldown_minutes} min triggered after {_ip_block_count} consecutive blocks"
+                            )
                     except Exception as e:
                         logger.error("Error processing channel %s: %s", cd["name"], e)
                         try:

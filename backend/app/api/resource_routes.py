@@ -182,7 +182,20 @@ async def add_channel(body: YouTubeChannelCreate, user: User = Depends(get_curre
 
     Returns:
         YouTubeChannelRead: The newly created channel subscription.
+
+    Raises:
+        HTTPException 409: Channel already exists for this user.
     """
+    # BUG-008 fix: check for existing channel to avoid duplicate key on constraint
+    existing = await db.execute(
+        select(YouTubeChannel).where(
+            YouTubeChannel.user_id == user.id,
+            YouTubeChannel.channel_id == body.channel_id,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(409, f"Channel '{body.channel_name}' is already being monitored")
+
     ch = YouTubeChannel(user_id=user.id, **body.model_dump())
     db.add(ch)
     await db.commit()

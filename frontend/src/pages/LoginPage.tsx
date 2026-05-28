@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface Props { onLogin: (token: string) => void }
 
@@ -17,7 +18,7 @@ export default function LoginPage({ onLogin }: Props) {
       const { data } = await api.post(url, { email, password })
       onLogin(data.access_token)
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Login failed')
+      setError(getErrorMessage(err, 'Login failed'))
     }
   }
 

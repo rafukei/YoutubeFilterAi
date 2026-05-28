@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import api from '../api'
+import { getErrorMessage } from '../utils/errorMessage'
 
 interface Bot { 
   id: string
@@ -19,7 +20,15 @@ export default function BotsPage() {
   const [addError, setAddError] = useState<string | null>(null)
   const [refreshingBot, setRefreshingBot] = useState<string | null>(null)
 
-  const load = () => api.get('/telegram-bots').then(r => setBots(r.data))
+  const load = async () => {
+    try {
+      const r = await api.get('/telegram-bots')
+      setBots(Array.isArray(r.data) ? r.data : [])
+    } catch (err) {
+      console.error('Failed to load bots:', err)
+      setBots([])
+    }
+  }
   useEffect(() => { load() }, [])
 
   const add = async () => {
@@ -35,7 +44,7 @@ export default function BotsPage() {
       setName('')
       load()
     } catch (err: any) {
-      setAddError(err.response?.data?.detail || 'Failed to add bot')
+      setAddError(getErrorMessage(err, 'Failed to add bot'))
     } finally {
       setAdding(false)
     }
@@ -54,7 +63,7 @@ export default function BotsPage() {
       await api.post(`/telegram-bots/${botId}/test`)
       setTestResult({ success: true, message: `Test message sent to ${botName}! Check Telegram.` })
     } catch (err: any) {
-      setTestResult({ success: false, message: err.response?.data?.detail || 'Test failed' })
+      setTestResult({ success: false, message: getErrorMessage(err, 'Test failed') })
     } finally {
       setTestingBot(null)
     }
@@ -68,7 +77,7 @@ export default function BotsPage() {
       setTestResult({ success: true, message: 'Chat ID updated!' })
       load()
     } catch (err: any) {
-      setTestResult({ success: false, message: err.response?.data?.detail || 'Could not find Chat ID — send /start to the bot first' })
+      setTestResult({ success: false, message: getErrorMessage(err, 'Could not find Chat ID — send /start to the bot first') })
     } finally {
       setRefreshingBot(null)
     }

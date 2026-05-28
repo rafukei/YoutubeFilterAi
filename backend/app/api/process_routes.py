@@ -11,6 +11,9 @@ import asyncio
 import logging
 from uuid import UUID
 
+TRANSCRIPT_COOLDOWN_SECONDS = 15 * 60
+TRANSCRIPT_RL_HIT_THRESHOLD_10M = 3
+
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
@@ -23,7 +26,8 @@ from app.schemas import MessageRead, ProcessVideoRequest, ProcessVideoResponse
 from app.services import extract_video_id, fetch_transcript
 from app.services.ai_service import parse_ai_routing, query_ai, resolve_folder_prompts
 from app.services.log_service import log_activity
-
+from app.services.telegram_service import send_telegram_message
+from app.services import RetryableYtdlpError
 logger = logging.getLogger(__name__)
 from app.services.telegram_service import send_telegram_message
 
@@ -40,6 +44,61 @@ def _get_redis(request: Request) -> aioredis.Redis:
         aioredis.Redis: Async Redis connection for rate limiting.
     """
     return request.app.state.redis
+
+
+async def _get_transcript_rate_limit_stats(redis: aioredis.Redis, user_id: str) -> dict[str, int]:
+    """Return per-user transcript request/rate-limit counters for multiple windows."""
+    req_1m = int(await redis.get(f"yt:transcript:req:{user_id}:1m") or 0)
+    req_1h = int(await redis.get(f"yt:transcript:req:{user_id}:1h") or 0)
+    req_3h = int(await redis.get(f"yt:transcript:req:{user_id}:3h") or 0)
+    rl_10m = int(await redis.get(f"yt:transcript:rl:{user_id}:10m") or 0)
+    rl_1h = int(await redis.get(f"yt:transcript:rl:{user_id}:1h") or 0)
+    rl_3h = int(await redis.get(f"yt:transcript:rl:{user_id}:3h") or 0)
+    return {
+        "req_1m": req_1m,
+        "req_1h": req_1h,
+        "req_3h": req_3h,
+        "rl_10m": rl_10m,
+        "rl_1h": rl_1h,
+        "rl_3h": rl_3h,
+    }
+
+
+async def _track_transcript_attempt(redis: aioredis.Redis, user_id: str) -> dict[str, int]:
+    """Increment per-user transcript attempt counters and return latest stats."""
+    p = redis.pipeline()
+    p.incr(f"yt:transcript:req:{user_id}:1m")
+    p.expire(f"yt:transcript:req:{user_id}:1m", 60)
+    p.incr(f"yt:transcript:req:{user_id}:1h")
+    p.expire(f"yt:transcript:req:{user_id}:1h", 3600)
+    p.incr(f"yt:transcript:req:{user_id}:3h")
+    p.expire(f"yt:transcript:req:{user_id}:3h", 10800)
+    await p.execute()
+    return await _get_transcript_rate_limit_stats(redis, user_id)
+
+
+async def _track_transcript_rate_limit(redis: aioredis.Redis, user_id: str) -> dict[str, int]:
+    """Increment per-user transcript rate-limit counters and return latest stats."""
+    p = redis.pipeline()
+    p.incr(f"yt:transcript:rl:{user_id}:10m")
+    p.expire(f"yt:transcript:rl:{user_id}:10m", 600)
+    p.incr(f"yt:transcript:rl:{user_id}:1h")
+    p.expire(f"yt:transcript:rl:{user_id}:1h", 3600)
+    p.incr(f"yt:transcript:rl:{user_id}:3h")
+    p.expire(f"yt:transcript:rl:{user_id}:3h", 10800)
+    await p.execute()
+    return await _get_transcript_rate_limit_stats(redis, user_id)
+
+
+async def _get_transcript_cooldown_ttl(redis: aioredis.Redis, user_id: str, video_id: str) -> int:
+    key = f"yt:transcript:cooldown:{user_id}:{video_id}"
+    ttl = await redis.ttl(key)
+    return ttl if isinstance(ttl, int) and ttl > 0 else 0
+
+
+async def _set_transcript_cooldown(redis: aioredis.Redis, user_id: str, video_id: str, seconds: int) -> None:
+    key = f"yt:transcript:cooldown:{user_id}:{video_id}"
+    await redis.set(key, "1", ex=seconds)
 
 
 @router.post("/process", response_model=ProcessVideoResponse)
@@ -86,8 +145,62 @@ async def process_video(
 
     # 2. Fetch transcript
     video_id = extract_video_id(body.video_url)
+
+    # Track request volume + prevent immediate repeated retry for same video after 429.
+    stats = await _track_transcript_attempt(redis, str(user.id))
+    cooldown_ttl = await _get_transcript_cooldown_ttl(redis, str(user.id), video_id)
+    if cooldown_ttl > 0:
+        await log_activity(
+            db,
+            user.id,
+            "WARNING",
+            "transcript",
+            (
+                f"Transcript fetch blocked by cooldown for {video_id}: {cooldown_ttl}s left; "
+                f"req_1m={stats['req_1m']} req_1h={stats['req_1h']} req_3h={stats['req_3h']} "
+                f"rl_10m={stats['rl_10m']} rl_1h={stats['rl_1h']} rl_3h={stats['rl_3h']}"
+            )
+        )
+        raise HTTPException(
+            429,
+            (
+                f"YouTube cooldown active ({cooldown_ttl}s left). "
+                f"Attempts: 1m={stats['req_1m']}, 1h={stats['req_1h']}, 3h={stats['req_3h']}. "
+                f"Rate-limit hits: 10m={stats['rl_10m']}, 1h={stats['rl_1h']}, 3h={stats['rl_3h']}."
+            )
+        )
+
     try:
         transcript = fetch_transcript(video_id)
+    except RetryableYtdlpError as e:
+        stats = await _track_transcript_rate_limit(redis, str(user.id))
+        if stats["rl_10m"] >= TRANSCRIPT_RL_HIT_THRESHOLD_10M:
+            await _set_transcript_cooldown(redis, str(user.id), video_id, TRANSCRIPT_COOLDOWN_SECONDS)
+            cooldown_ttl = TRANSCRIPT_COOLDOWN_SECONDS
+        else:
+            cooldown_ttl = 0
+
+        await log_activity(
+            db,
+            user.id,
+            "WARNING",
+            "transcript",
+            (
+                f"Rate-limited fetching transcript for {video_id}: {e}; "
+                f"req_1m={stats['req_1m']} req_1h={stats['req_1h']} req_3h={stats['req_3h']} "
+                f"rl_10m={stats['rl_10m']} rl_1h={stats['rl_1h']} rl_3h={stats['rl_3h']} "
+                f"cooldown_s={cooldown_ttl}"
+            )
+        )
+        raise HTTPException(
+            503,
+            (
+                "YouTube temporary rate limit hit while fetching subtitles. "
+                f"Attempts: 1m={stats['req_1m']}, 1h={stats['req_1h']}, 3h={stats['req_3h']}. "
+                f"Rate-limit hits: 10m={stats['rl_10m']}, 1h={stats['rl_1h']}, 3h={stats['rl_3h']}. "
+                + (f"Cooldown set for this video: {cooldown_ttl}s." if cooldown_ttl else "")
+            )
+        )
     except Exception as e:
         err = str(e).lower()
         await log_activity(db, user.id, "ERROR", "transcript", f"Failed to fetch transcript for {video_id}: {e}")
@@ -115,7 +228,7 @@ async def process_video(
                         str(user.id), prompt_id_debug, ai_model, fallback_model, len(prompt_text) if prompt_text else "N/A", len(transcript))
             await log_activity(db, user.id, "DEBUG", "ai", f"Calling query_ai prompt_id={prompt_id_debug} model={ai_model} fallback={fallback_model} transcript_chars={len(transcript)}")
 
-            ai_response = await query_ai(
+            ai_result = await query_ai(
                 prompt=prompt_text,
                 transcript=transcript,
                 api_token=user.openrouter_api_token,
@@ -123,7 +236,12 @@ async def process_video(
                 redis_client=redis,
                 model=ai_model,
                 fallback_model=fallback_model,
+                return_model=True,
             )
+            if isinstance(ai_result, tuple) and len(ai_result) == 2:
+                ai_response, model_used = ai_result
+            else:
+                ai_response, model_used = ai_result, ai_model
         except RuntimeError as e:
             await log_activity(db, user.id, "ERROR", "ai", f"AI query failed (model={ai_model}): {e}")
             raise HTTPException(502, str(e))
@@ -132,7 +250,7 @@ async def process_video(
 
         # Parse the prompt's own routing JSON to use as fallback
         prompt_routing = parse_ai_routing(prompt_text) if prompt_text else {}
-        routing = parse_ai_routing(ai_response, prompt_routing=prompt_routing)
+        routing = parse_ai_routing(ai_response, prompt_routing=prompt_routing, ai_model=model_used)
         messages_created = []
 
         target_views = routing.get("web_views", [])

@@ -133,6 +133,47 @@ class TestParseAiRouting:
         # Behavior depends on implementation - may find JSON or fallback
         assert result["message"] is not None
 
+    def test_ai_model_attribution_with_valid_json(self):
+        """AI model attribution is appended to the message when ai_model is provided."""
+        response = '{"message": "summary text", "telegram_bots": [], "web_views": [], "visibility": true}'
+        result = parse_ai_routing(response, ai_model="openai/gpt-4o-mini")
+        assert "summary text" in result["message"]
+        assert "GPT-4o Mini" in result["message"]
+        assert "🤖 AI model:" in result["message"]
+
+    def test_ai_model_attribution_fallback_response(self):
+        """AI model attribution is appended even when no valid JSON is found."""
+        response = "Plain text response with no JSON block"
+        result = parse_ai_routing(response, ai_model="anthropic/claude-3.5-sonnet")
+        assert "Plain text response" in result["message"]
+        assert "Claude 3.5 Sonnet" in result["message"]
+        assert "🤖 AI model:" in result["message"]
+
+    def test_ai_model_attribution_unknown_model(self):
+        """Unknown model IDs are returned as-is (not mapped to friendly name)."""
+        response = '{"message": "msg", "telegram_bots": [], "web_views": [], "visibility": true}'
+        result = parse_ai_routing(response, ai_model="unknown/model-x")
+        assert "unknown/model-x" in result["message"]
+
+    def test_no_attribution_when_ai_model_none(self):
+        """No attribution footer when ai_model is not provided."""
+        response = '{"message": "msg", "telegram_bots": [], "web_views": [], "visibility": true}'
+        result = parse_ai_routing(response)
+        assert result["message"] == "msg"
+        assert "AI model" not in result["message"]
+
+    def test_friendly_model_name_mapping(self):
+        """Known model IDs are converted to friendly names."""
+        from app.services.ai_service import _friendly_model_name
+        assert _friendly_model_name("openai/gpt-4.1-mini") == "GPT-4.1 Mini"
+        assert _friendly_model_name("openai/gpt-3.5-turbo") == "GPT-3.5 Turbo"
+        assert _friendly_model_name("anthropic/claude-3-haiku") == "Claude 3 Haiku"
+        assert _friendly_model_name("google/gemini-pro-1.5") == "Gemini Pro 1.5"
+        assert _friendly_model_name("meta-llama/llama-3.1-70b-instruct") == "Llama 3.1 70B"
+        assert _friendly_model_name("gpt-oss-120b") == "GPT-OSS 120B (Free)"
+        # Unknown model returns as-is
+        assert _friendly_model_name("custom/model") == "custom/model"
+
 
 class TestTranscriptService:
     """Tests for YouTube transcript fetching service."""

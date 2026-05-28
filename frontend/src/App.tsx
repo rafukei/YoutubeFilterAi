@@ -81,6 +81,9 @@ function App() {
         <Route path="/admin/users" element={<AdminUsersPage />} />
         <Route path="/admin/settings" element={<AdminSettingsPage />} />
       </Route>
+
+      {/* Fallback: avoid blank screen on unknown/stale URLs */}
+      <Route path="*" element={<Navigate to={token ? "/" : "/login"} replace />} />
     </Routes>
   )
 }
